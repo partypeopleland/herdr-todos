@@ -858,7 +858,8 @@ export default class Todos extends View {
   add(typed, cx) {
     let text = typed.trim();
     if (!text) return;
-    let folder = this.filter ? this.lists[this.filter]?.folder ?? this.here : this.here;
+    // No "#project": yours (Personal). A picked chip or "#tag" still wins.
+    let folder = this.filter ? this.lists[this.filter]?.folder ?? PERSONAL() : PERSONAL();
     const tag = /(?:^|\s)#([\w.-]+)/.exec(text);
     if (tag) { const f = this.projectFor(tag[1]); if (f) { folder = f; text = (text.slice(0, tag.index) + text.slice(tag.index + tag[0].length)).replace(/\s+/g, " ").trim(); } }
     if (!folder) return;
@@ -1130,7 +1131,7 @@ export default class Todos extends View {
         .child(section("todo", "To-do", list.length, !this.todoFolded, () => { this.todoFolded = !this.todoFolded; }, null, { color: t.accent }))
         .when(!this.todoFolded, (el) => el.children(list.flatMap(withStarter)))
         .when(!list.length, (el) => el.child(div().px(8).py(6).text_size(12).text_color(t.dim)
-          .child(this.filter ? "Nothing left here" : `Nothing to do. New ones go to ${this.here ? this.name(this.here) : "this project"}.`)))
+          .child(this.filter ? "Nothing left here" : `Nothing to do. New ones go to Personal (or pick a project with #).`)))
         .when(fromFile.items.length > 0, (el) => el
           .child(section("file", `From ${fromFile.file}`, fromFile.items.length, !this.fileFolded, () => { this.fileFolded = !this.fileFolded; },
             div().id("take-all").px(5).rounded(4).cursor_pointer().hover((x) => x.bg(t.raised).text_color(t.foreground)).child("Add all")
