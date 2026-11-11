@@ -11,7 +11,8 @@
 // Shown: today's date; a chip per project with open to-dos (its colour, as the
 // sidebar's: a hash of its folder's name) and "All"; one list, the project
 // you're in first, then by due time; each to-do with its project and when it's
-// due (red once past); "Done today". Adding: to the project you're in, or
+// due (red once past); "Doing" ([~]: being worked on, `todo doing`) and
+// "Done today". Adding: to the project you're in, or
 // "#name" for another; "@today" / "@fri" / "@nextweek" / "@in2h" / "@12nov" / "@4/11"
 // (day and month in the computer's order; every form is listed above readWhen), with a time
 // ("@14:30", "@fri 9am") or not. A circle ticks; double-click edits; × deletes.
@@ -68,9 +69,14 @@ const mOf = (folder) => {
   return FOLDER_M.get(folder.replace(/\/+$/, "")) ?? null;
 };
 const onM = (m) => (m ? { on: m } : {});
-// Personal to-dos: not a project — ~/.todo's list (personal.md in DIR), local
-// only, for things like "meeting at 3". `todo personal` writes the same file.
+// Personal to-dos: not a project — this machine's own ~/.todo/todo-<machine>.md,
+// local only, for things like "meeting at 3". `todo personal` writes the same
+// file; other machines' copies pushed here keep their names (read-only there).
 const PERSONAL = () => `${home()}/.todo`;
+let myId = null, idP = null;
+const machineId = () => (idP ??= exec("sh", ["-c", "hostname | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9-]/-/g'"])
+  .then((r) => r?.stdout.trim() || "unknown", () => "unknown"));
+const PFILE = () => `${PERSONAL()}/todo-${myId}.md`;
 let personalSlug = null;
 const isPersonal = (folder) => {
   if (!folder) return false;
@@ -116,7 +122,7 @@ const toFile = (folder, ...args) => (SYNCED.has(folder) ? cross(folder, ...args)
 // TODO.md follows what's added, edited or deleted here (off unless on).
 const SYNCED = new Set(); // folders with Sync on
 const slugOf = (folder) => folder.replace(/\/+$/, "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "");
-const ITEM = /^- \[( |x)\] (.*)$/;
+const ITEM = /^- \[( |x|~)\] (.*)$/;
 // A click that picks rather than acts, as in the over9k sidebar.
 // Log and Sync for a project that never set them: Options › To-do.
 const defOpts = () => { const o = shared("sidebar.options") ?? {}; return { log: o.todoLog !== false, sync: o.todoSync === true }; };
@@ -190,14 +196,14 @@ function parseLine(text) {
 // "<!-- skip: text -->" lines: TODO.md items hidden from the suggestions.
 function parse(raw) {
   const folder = /^<!-- folder: (.*) -->$/m.exec(raw ?? "")?.[1] ?? null;
-  const items = (raw ?? "").split("\n").map((l) => ITEM.exec(l)).filter(Boolean).map((m) => ({ done: m[1] === "x", ...parseLine(m[2]) }));
+  const items = (raw ?? "").split("\n").map((l) => ITEM.exec(l)).filter(Boolean).map((m) => ({ done: m[1] === "x", doing: m[1] === "~", ...parseLine(m[2]) }));
   const skipped = [...(raw ?? "").matchAll(/^<!-- skip: (.*) -->$/gm)].map((m) => m[1]);
   // "<!-- log: on|off -->" / "<!-- sync: on|off -->" when set, else the default.
   const d = defOpts(), log = /^<!-- log: (on|off) -->$/m.exec(raw ?? "")?.[1], sync = /^<!-- sync: (on|off) -->$/m.exec(raw ?? "")?.[1];
   const opts = { log: log ? log === "on" : d.log, sync: sync ? sync === "on" : d.sync, set: { log: Boolean(log), sync: Boolean(sync) } };
   return { folder, items, skipped, opts };
 }
-const line = (i) => `- [${i.done ? "x" : " "}] ${i.text.replace(/\n/g, " ")}${i.due ? ` <!-- due: ${i.due} -->` : ""}${i.done && i.doneOn ? ` <!-- done: ${i.doneOn} -->` : ""}`;
+const line = (i) => `- [${i.done ? "x" : i.doing ? "~" : " "}] ${i.text.replace(/\n/g, " ")}${i.due ? ` <!-- due: ${i.due} -->` : ""}${i.done && i.doneOn ? ` <!-- done: ${i.doneOn} -->` : ""}`;
 const serialize = (folder, items, skipped = [], opts = {}) => `<!-- folder: ${folder} -->\n${opts.set?.log ? `<!-- log: ${opts.log ? "on" : "off"} -->\n` : ""}${opts.set?.sync ? `<!-- sync: ${opts.sync ? "on" : "off"} -->\n` : ""}${skipped.map((x) => `<!-- skip: ${x.replace(/-->/g, "")} -->\n`).join("")}${items.map(line).join("\n")}${items.length ? "\n" : ""}`;
 
 // A project's own to-do file (TODO.md and the like), read, never written: its
@@ -476,10 +482,20 @@ export default class Todos extends View {
     cx.spawn(async (cx) => {
       dataDir = (await exec("sh", ["-c", XDG_DIR]).catch(() => null))?.stdout.trim() || null;
       await exec("mkdir", ["-p", DIR()]).catch(() => null);
+      myId = await machineId();
+      await exec("mkdir", ["-p", PERSONAL()]).catch(() => null);
       await this.load(cx);
       await this.loadRemote(cx);
       for (;;) {
         await watchFolder(DIR()).catch(() => cx.sleep(5000));
+        await this.load(cx);
+      }
+    });
+    // ~/.todo isn't under DIR: watch it too, so `todo personal` from a shell
+    // (or a synced copy arriving) reloads the panel.
+    cx.spawn(async (cx) => {
+      for (;;) {
+        await watchFolder(PERSONAL()).catch(() => cx.sleep(5000));
         await this.load(cx);
       }
     });
@@ -508,8 +524,14 @@ export default class Todos extends View {
       const { folder, items, skipped, opts } = parse(raw);
       if (folder) lists[f.slice(0, -3)] = { folder: isPersonal(folder) ? PERSONAL() : folder, items, skipped, opts, raw };
     }
+    // The personal list lives outside DIR, in ~/.todo: this machine's own file.
+    const praw = myId ? await readTextFile(PFILE()).catch(() => null) : null;
+    const prevPersonal = this.lists?.personal?.raw ?? null;
     // The personal list exists even before its first item (its chip shows 0).
-    lists.personal ??= { folder: PERSONAL(), items: [], skipped: [], opts: defOpts(), raw: null };
+    if (praw != null) {
+      const p = parse(praw);
+      lists.personal = { folder: PERSONAL(), items: p.items, skipped: p.skipped, opts: p.opts, raw: praw };
+    } else lists.personal ??= { folder: PERSONAL(), items: [], skipped: [], opts: defOpts(), raw: null };
     // A list that changed: its TODO.md is read again before suggesting from it
     // (an agent's edit reaches TODO.md a moment after the list).
     for (const [slug, l] of Object.entries(lists)) if (this.lists?.[slug]?.raw !== l.raw) { this.fileAt[l.folder] = 0; this.fileStale[l.folder] = true; }
@@ -517,6 +539,9 @@ export default class Todos extends View {
     this.lists = lists;
     SYNCED.clear();
     for (const l of Object.values(lists)) if (l.opts.sync) SYNCED.add(l.folder);
+    // The personal file changed here (a `todo personal` in a shell, or the
+    // panel's own write already pushed): send the new copy to the machines.
+    if (praw !== prevPersonal) this.pushPersonal(cx);
     cx.notify();
   }
 
@@ -565,7 +590,24 @@ export default class Todos extends View {
       if (mk && (seen.has(mk) ? !(k in found) : !ms.includes(mk))) delete this.lists[k];
     }
     Object.assign(this.lists, found);
+    this.remoteMachines = ms;
+    // First look after start: push this machine's personal file to them all.
+    if (!this.pushedInit) { this.pushedInit = true; this.pushPersonal(cx); }
     cx.notify();
+  }
+
+  // This machine's personal file, to every other computer's ~/.todo under the
+  // same name (read-only there — the file name says whose it is). Pushed on
+  // start and whenever it changes here; never pulled back.
+  async pushPersonal(cx) {
+    if (!myId) return;
+    const raw = await readTextFile(PFILE()).catch(() => null);
+    const ms = this.remoteMachines ?? [];
+    if (raw == null || !ms.length) return;
+    const name = `todo-${myId}.md`;
+    await Promise.all(ms.map((m) => exec("sh", ["-c",
+      'd="$HOME/.todo"; mkdir -p "$d" && printf %s "$1" > "$d/$2.tmp" && mv "$d/$2.tmp" "$d/$2"',
+      "sh", raw, name], onM(m)).catch(() => null)));
   }
 
   // The project you're in: the focused terminal's folder (else the shown
@@ -635,7 +677,7 @@ export default class Todos extends View {
   }
 
   async write(slug, folder, items, cx, skipped = this.lists[slug]?.skipped ?? [], opts = this.lists[slug]?.opts ?? defOpts()) {
-    const path = `${DIR()}/${slug}.md`, old = this.lists[slug]?.raw ?? null;
+    const path = slug === "personal" ? PFILE() : `${DIR()}/${slug}.md`, old = this.lists[slug]?.raw ?? null;
     const text = serialize(folder, items, skipped, opts);
     const m = machineOf(slug);
     if (m) {
@@ -649,6 +691,7 @@ export default class Todos extends View {
       await writeTextFile(path, text, old);
       this.lists[slug] = { folder, items, skipped, opts, raw: text };
       if (opts.sync) SYNCED.add(folder); else SYNCED.delete(folder);
+      if (slug === "personal") this.pushPersonal(cx);
     } catch {
       await this.load(cx); // an agent changed it meanwhile: show theirs
     }
@@ -691,7 +734,7 @@ export default class Todos extends View {
 
   take(folder, texts, cx) {
     const slug = keyOf(folder), l = this.lists[slug];
-    cx.spawn(async (cx) => this.write(slug, folder, [...(l?.items ?? []), ...texts.map((text) => ({ done: false, text, due: null, doneOn: null }))], cx));
+    cx.spawn(async (cx) => this.write(slug, folder, [...(l?.items ?? []), ...texts.map((text) => ({ done: false, doing: false, text, due: null, doneOn: null }))], cx));
   }
 
   // All, or only the project you're in (kept for next time); picks are dropped.
@@ -765,7 +808,7 @@ export default class Todos extends View {
     const xs = this.picked(), on = xs.some((x) => !x.done);
     for (const slug of new Set(xs.map((x) => x.slug))) {
       const at = new Set(xs.filter((x) => x.slug === slug).map((x) => x.i));
-      this.change(slug, (items) => items.map((y, j) => (at.has(j) && y.done !== on ? { ...y, done: on, doneOn: on ? stamp() : null } : y)), cx);
+      this.change(slug, (items) => items.map((y, j) => (at.has(j) && y.done !== on ? { ...y, done: on, doing: on ? false : y.doing, doneOn: on ? stamp() : null } : y)), cx);
     }
     for (const x of xs) if (x.done !== on) { cross(x.folder, on ? "done" : "undo", x.text); this.fileAt[x.folder] = 0; }
     this.unpick();
@@ -868,7 +911,7 @@ export default class Todos extends View {
     const slug = keyOf(folder), l = this.lists[slug];
     this.input.set_value("");
     this.typed = "";
-    cx.spawn(async (cx) => this.write(slug, folder, [...(l?.items ?? []), { done: false, text: rest, due, doneOn: null }], cx));
+    cx.spawn(async (cx) => this.write(slug, folder, [...(l?.items ?? []), { done: false, doing: false, text: rest, due, doneOn: null }], cx));
     toFile(folder, "add", rest);
   }
 
@@ -902,7 +945,7 @@ export default class Todos extends View {
     if (this.proj && !this.lists[this.proj]) this.proj = null;
     this.filter = this.proj ?? (this.mode === "here" && hereOk ? hereSlug : null);
     const all = Object.entries(this.lists).filter(([, l]) => inScope(l)).flatMap(([slug, l]) => l.items.map((x, i) => ({ ...x, slug, i, folder: l.folder })));
-    const open = all.filter((x) => !x.done), doneToday = all.filter((x) => x.done).sort((a, b) => (b.doneOn ?? "").localeCompare(a.doneOn ?? ""));
+    const open = all.filter((x) => !x.done && !x.doing), doings = all.filter((x) => x.doing && !x.done), doneToday = all.filter((x) => x.done).sort((a, b) => (b.doneOn ?? "").localeCompare(a.doneOn ?? ""));
     // A chip per project with to-dos (the one you're in has its own): its
     // open count, so an all-done project still gets one to look back at.
     const bySlug = {};
@@ -916,8 +959,9 @@ export default class Todos extends View {
     const shown = (list) => list.filter((x) => !this.filter || x.slug === this.filter);
     const dueKey = (x) => (x.due ? x.due.padEnd(16, " ") : "~");
     const list = shown(open).sort((a, b) => (b.slug === hereSlug) - (a.slug === hereSlug) || dueKey(a).localeCompare(dueKey(b)) || a.slug.localeCompare(b.slug) || a.i - b.i);
+    const doingList = shown(doings).sort((a, b) => (b.slug === hereSlug) - (a.slug === hereSlug) || dueKey(a).localeCompare(dueKey(b)) || a.slug.localeCompare(b.slug) || a.i - b.i);
     const done = shown(doneToday);
-    this.visible = [...list, ...done.slice(0, this.doneShown ?? 5)];
+    this.visible = [...doingList, ...list, ...done];
     const picks = this.picked();
     if (picks.length !== this.sel.size) { this.sel = new Map(picks.map((x) => [`${x.slug}:${x.i}`, x.text])); if (!picks.length) this.unpick(); }
     const now = new Date();
@@ -955,9 +999,10 @@ export default class Todos extends View {
         .on_hover((on, cx) => { this.hover = on ? key : this.hover === key ? null : this.hover; cx.notify(); })
         .child(div().id(`tick-${key}`).size(14).flex_none().rounded(7).border(1.5).cursor_pointer().border_color(c)
           .when(x.done, (el) => el.bg(c).flex().items_center().justify_center().child(svg("mods/workspace-chrome/check.svg").size(9).text_color(t.background)))
+          .when(x.doing && !x.done, (el) => el.bg(t.working).flex().items_center().justify_center().child(div().text_size(10).font_semibold().text_color(t.background).child("~")))
           .on_click((e, cx) => {
             if (multi(e) && this.filter) return; // the row picks it
-            this.change(x.slug, (items) => items.map((y, j) => (j === x.i ? { ...y, done: !y.done, doneOn: y.done ? null : stamp() } : y)), cx);
+            this.change(x.slug, (items) => items.map((y, j) => (j === x.i ? { ...y, done: !y.done, doing: false, doneOn: y.done ? null : stamp() } : y)), cx);
             // Crossed out (or back in) in the project's own TODO.md too, if it lists it.
             cross(x.folder, x.done ? "undo" : "done", x.text);
             this.fileAt[x.folder] = 0;
@@ -972,6 +1017,10 @@ export default class Todos extends View {
         // In All, its project's name, in its colour, last so every row's lines up
         // on the right (the tabs above filter by it).
         .when(!this.filter && !editing && !(hovered && !x.done), (el) => el.child(div().flex_none().max_w(110).truncate().text_right().text_size(11).text_color(c).child(machineOf(x.slug) ? `${machineOf(x.slug)}/${this.name(x.folder)}` : this.name(x.folder))))
+        .when(hovered && !editing && !x.done, (el) => el.child(div().id(`doing-${key}`).size(20).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+          .hover((s) => s.bg(t.raised)).tooltip(x.doing ? "Back to to-do" : "Doing")
+          .on_click((_e, cx) => { this.change(x.slug, (items) => items.map((y, j) => (j === x.i ? { ...y, doing: !y.doing } : y)), cx); })
+          .child(svg("mods/workspace-chrome/clock.svg").size(11).text_color(x.doing ? t.working : t.muted))))
         .when((hovered || this.startFor === key) && !editing && !x.done && this.agentChoices.length > 0, (el) => el.child(div().id(`start-${key}`).size(20).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
           .when(this.startFor === key, (el) => el.bg(t.selected))
           .hover((s) => s.bg(t.raised)).on_click((_e, cx) => { this.pickOpen = false; this.startFor = this.startFor === key ? null : key; cx.notify(); })
@@ -1082,8 +1131,6 @@ export default class Todos extends View {
       .tooltip(`${tip} (${on ? "on" : "off"}: click to turn ${on ? "off" : "on"})`)
       .on_click((_e, cx) => { fn(cx); cx.notify(); })
       .child(svg(icon).size(10).flex_none()).child(label);
-    const more = (id, label, fn) => div().id(id).px(5).py(2).rounded(4).cursor_pointer().text_size(11).text_color(t.dim)
-      .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => { fn(); cx.notify(); }).child(label);
     return v_flex().size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().child("To-do"))
@@ -1132,6 +1179,9 @@ export default class Todos extends View {
         .when(!this.todoFolded, (el) => el.children(list.flatMap(withStarter)))
         .when(!list.length, (el) => el.child(div().px(8).py(6).text_size(12).text_color(t.dim)
           .child(this.filter ? "Nothing left here" : `Nothing to do. New ones go to Personal (or pick a project with #).`)))
+        // Doing: being worked on ([~] in the file); a row's clock button toggles it.
+        .child(section("doing", "Doing", doingList.length, !this.doingFolded, () => { this.doingFolded = !this.doingFolded; }, null, { color: t.working }))
+        .when(!this.doingFolded, (el) => el.children(doingList.flatMap(withStarter)))
         .when(fromFile.items.length > 0, (el) => el
           .child(section("file", `From ${fromFile.file}`, fromFile.items.length, !this.fileFolded, () => { this.fileFolded = !this.fileFolded; },
             div().id("take-all").px(5).rounded(4).cursor_pointer().hover((x) => x.bg(t.raised).text_color(t.foreground)).child("Add all")
@@ -1151,8 +1201,8 @@ export default class Todos extends View {
               .hover((x) => x.bg(t.raised)).tooltip(`Delete from ${fromFile.file ?? "TODO.md"}`).on_click((_e, cx) => this.dropFromFile(focusFolder, text, cx))
               .child(svg("mods/workspace-chrome/x.svg").size(11).text_color(t.muted)))),
             ...(this.startFor === `file:${i}` ? [starter({ text, folder: focusFolder }, (a, cx, running) => this.startFromFile(a, focusFolder, text, cx, running))] : [])])))
-        // Done: the latest few (Show more for 10 more), and Clear (twice) to
-        // delete the ticked ones of the projects shown, as `todo clear`.
+        // Done: all of them (the list scrolls), and Clear (twice) to delete
+        // the ticked ones of the projects shown, as `todo clear`.
         .when(done.length > 0, (el) => el
           .child(section("done", "Done", done.length, !this.doneFolded, () => { this.doneFolded = !this.doneFolded; },
             div().id("done-clear").px(5).rounded(4).cursor_pointer().text_color(this.clearArmed ? t.ansi1 : t.dim).hover((s) => s.bg(t.raised).text_color(t.foreground))
@@ -1164,9 +1214,6 @@ export default class Todos extends View {
               })
               .child(this.clearArmed ? `Clear ${done.length}?` : "Clear"),
             { color: t.done }))
-          .children(this.doneFolded ? [] : done.slice(0, this.doneShown ?? 5).map(row))
-          .when(!this.doneFolded && done.length > 5, (el) => el.child(h_flex().mx(4).mt(2).gap(2)
-            .when(done.length > (this.doneShown ?? 5), (el) => el.child(more("done-more", `Show ${Math.min(10, done.length - (this.doneShown ?? 5))} more`, () => { this.doneShown = (this.doneShown ?? 5) + 10; })))
-            .when((this.doneShown ?? 5) > 5, (el) => el.child(more("done-less", "Show less", () => { this.doneShown = 5; })))))));
+          .children(this.doneFolded ? [] : done.map(row))));
   }
 }

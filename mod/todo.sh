@@ -5,13 +5,15 @@
 #   todo all                 every project's
 #   todo add <text…>         add to this project's (--due "YYYY-MM-DD[ HH:MM]" first sets when)
 #   todo done|undo <n|text>  tick or untick item n (or the one with that exact text)
+#   todo doing|start <n|text> mark item n as being worked on; `todo open <n>` back to plain
 #   todo edit <n|text> <new…> reword item n (its due and tick stay)
 #   todo rm <n>              delete item n
 #   todo clear               delete the ticked ones
 #   todo log [on|off]        this project: agents add what you ask for (default: Options › To-do)
 #   todo sync [on|off]       this project: its TODO.md follows add/edit/rm (default: Options › To-do)
 #   todo --rule on|off       add or remove the agents' to-do rule (CLAUDE.md, AGENTS.md)
-#   todo personal …          your own list, not a project's (~/.todo → personal.md)
+#   todo personal …          your own list, not a project's (~/.todo/todo-<machine>.md;
+#                            lists other machines synced here show read-only)
 # -p <folder> (first) picks the project; otherwise it's the git repo this runs in
 # (its main checkout for a worktree), else this folder.
 # Each list is ~/.local/share/over9k/todos/<slug>.md (DIR): a "<!-- folder: … -->"
@@ -44,6 +46,11 @@ partly done, and say so. When they change, narrow or drop a request, correct its
 item instead of adding another: `todo edit <n> <new text>` rewords it, `todo rm <n>`
 removes it. When they say to stop or start logging, run `todo log off` / `todo log on` (that project only). Also add an item when the user asks you to note something for later, or
 when you leave follow-up work undone. Keep items short, one line each.
+While you work on an item, mark it `todo doing <n>` (the panel's Doing section);
+`todo done <n>` finishes it, `todo open <n>` returns it to plain to-do.
+For the user's own non-project to-dos (personal errands, reminders), use
+`todo personal` with the same subcommands — it is not tied to any repo; lists
+synced there from other machines are read-only.
 <!-- /over9k:todo -->
 EOF
     } >> "$f"
@@ -60,8 +67,13 @@ PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
 dir=$DIR
 mkdir -p "$dir"
 folder=""
-# `todo personal …` is `-p ~/.todo`: one fixed list file, personal.md.
-if [ "$1" = "personal" ]; then shift; mkdir -p "$HOME/.todo"; set -- -p "$HOME/.todo" "$@"; fi
+# This machine's id for ~/.todo/todo-<machine>.md: other machines' Herdr pushes
+# their own file here (read-only; `todo personal` lists it, can't change it).
+MACHINE=$(hostname 2>/dev/null | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9-]/-/g')
+MACHINE=${MACHINE:-unknown}
+PERS=""
+# `todo personal …` is this machine's own list in ~/.todo.
+if [ "$1" = "personal" ]; then shift; mkdir -p "$HOME/.todo"; PERS=1; set -- -p "$HOME/.todo" "$@"; fi
 if [ "$1" = "-p" ]; then folder=$(cd "$2" && pwd); shift 2; fi
 if [ -z "$folder" ]; then
   common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
@@ -81,35 +93,52 @@ opt() {
 md() { [ -n "$PY" ] && opt sync && "$PY" -I "$HERE/todo-cross.py" "$folder" "$@" 2>/dev/null || true; }
 slug=$(printf %s "$folder" | sed 's/[^A-Za-z0-9][^A-Za-z0-9]*/-/g; s/^-//; s/-$//')
 file="$dir/$slug.md"
-# ~/.todo (however pwd spelled it) is the personal list: one fixed file, so the
-# panel's "personal" key and `todo personal` always meet in personal.md.
+# ~/.todo (however pwd spelled it) is the personal list: this machine's own
+# file, todo-<machine>.md — synced copies of other machines' keep their names.
 pslug=$(printf %s "$HOME/.todo" | sed 's/[^A-Za-z0-9][^A-Za-z0-9]*/-/g; s/^-//; s/-$//' | tr 'A-Z' 'a-z')
-if [ "$(printf %s "$slug" | tr 'A-Z' 'a-z')" = "$pslug" ]; then file="$dir/personal.md"; fi
+if [ "$(printf %s "$slug" | tr 'A-Z' 'a-z')" = "$pslug" ]; then file="$HOME/.todo/todo-$MACHINE.md"; fi
 
-items() { [ -f "$1" ] && grep -E '^- \[( |x)\] ' "$1" || true; }
+items() { [ -f "$1" ] && grep -E '^- \[( |x|~)\] ' "$1" || true; }
 show() {
   f=$1; n=0
   items "$f" | while IFS= read -r l; do n=$((n + 1))
     due=$(printf %s "$l" | sed -n 's/.*<!-- due: \([^>]*\) -->.*/\1/p')
     on=$(printf %s "$l" | sed -n 's/.*<!-- done: \([^>]*\) -->.*/\1/p')
     text=$(printf %s "$l" | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g')
-    case "$l" in "- [x] "*) box=x ;; *) box=" " ;; esac
+    case "$l" in "- [x] "*) box=x ;; "- [~] "*) box="~" ;; *) box=" " ;; esac
     printf '%3d. [%s] %s%s\n' "$n" "$box" "$text" "${due:+  (due $due)}${on:+  (done $on)}"
+  done
+}
+# A synced personal list from another machine: shown, never numbered (can't be
+# changed from here — it belongs to that machine).
+showro() {
+  items "$1" | while IFS= read -r l; do
+    text=$(printf %s "$l" | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g')
+    case "$l" in "- [x] "*) printf '    [x] %s\n' "$text" ;; "- [~] "*) printf '    [~] %s\n' "$text" ;; *) printf '    [ ] %s\n' "$text" ;; esac
   done
 }
 # Rewrites item $1 of this list with sed expression $2 (on that line only).
 edit() {
   [ -f "$file" ] || { echo "No to-dos for $folder" >&2; exit 1; }
-  line=$(grep -n -E '^- \[( |x)\] ' "$file" | sed -n "${1}p" | cut -d: -f1)
+  line=$(grep -n -E '^- \[( |x|~)\] ' "$file" | sed -n "${1}p" | cut -d: -f1)
   [ -n "$line" ] || { echo "No item $1" >&2; exit 1; }
   sed "${line}$2" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
 }
 
 cmd=${1:-list}; [ $# -gt 0 ] && shift
 case "$cmd" in
-  list|ls) [ -n "$(items "$file")" ] && show "$file" || echo "No to-dos for $folder" ;;
+  list|ls)
+    [ -n "$(items "$file")" ] && show "$file" || echo "No to-dos for $folder"
+    # Personal: other machines' synced files, read-only (unnumbered on purpose).
+    if [ -n "$PERS" ]; then
+      for f in "$HOME/.todo"/todo-*.md; do
+        [ -f "$f" ] && [ "$f" != "$file" ] || continue
+        [ -n "$(items "$f")" ] || continue
+        m=${f##*/todo-}; printf '%s\n' "— synced from ${m%.md} (read-only) —"; showro "$f"
+      done
+    fi ;;
   all)
-    for f in "$dir"/*.md; do
+    for f in "$dir"/*.md "$HOME/.todo/todo-$MACHINE.md"; do
       [ -f "$f" ] && [ -n "$(items "$f")" ] || continue
       printf '%s\n' "$(sed -n 's/^<!-- folder: \(.*\) -->$/\1/p' "$f" | head -n 1 | sed "s#^$HOME#~#")"; show "$f"
     done ;;
@@ -125,21 +154,34 @@ case "$cmd" in
   done|check|undo|uncheck)
     n=${1:?item number or text}
     # The item's text works too: its number, from an exact match.
-    case "$n" in *[!0-9]*) m=$(grep -E '^- \[( |x)\] ' "$file" 2>/dev/null | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g' | grep -n -x -F -- "$n" | head -n 1 | cut -d: -f1)
+    case "$n" in *[!0-9]*) m=$(grep -E '^- \[( |x|~)\] ' "$file" 2>/dev/null | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g' | grep -n -x -F -- "$n" | head -n 1 | cut -d: -f1)
       [ -n "$m" ] || { echo "No item \"$n\"" >&2; exit 1; }; n=$m ;; esac
-    text=$(grep -E '^- \[( |x)\] ' "$file" 2>/dev/null | sed -n "${n}p" | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g')
+    text=$(grep -E '^- \[( |x|~)\] ' "$file" 2>/dev/null | sed -n "${n}p" | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g')
     case "$cmd" in done|check) way=done ;; *) way=undo ;; esac
     "$0" -p "$folder" "_$way" "$n"
     [ -n "$text" ] && { [ -n "$PY" ] && "$PY" -I "$HERE/todo-cross.py" "$folder" "$way" "$text" 2>/dev/null; } || true ;;
-  _done) edit "${1:?item number}" "s/^- \\[ \\] \\(.*\\)\$/- [x] \\1 <!-- done: $(date '+%F %H:%M') -->/" ;;
+  _done) edit "${1:?item number}" "s/^- \\[[ ~]\\] \\(.*\\)\$/- [x] \\1 <!-- done: $(date '+%F %H:%M') -->/" ;;
   _undo) edit "${1:?item number}" 's/^- \[x\] /- [ ] /; s/ *<!-- done: [^>]* -->//' ;;
+  # Being worked on ([~]) or back to plain ([ ]): the panel's Doing section.
+  doing|start)
+    n=${1:?item number or text}
+    case "$n" in *[!0-9]*) m=$(grep -E '^- \[( |x|~)\] ' "$file" 2>/dev/null | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g' | grep -n -x -F -- "$n" | head -n 1 | cut -d: -f1)
+      [ -n "$m" ] || { echo "No item \"$n\"" >&2; exit 1; }; n=$m ;; esac
+    "$0" -p "$folder" "_doing" "$n" ;;
+  open)
+    n=${1:?item number or text}
+    case "$n" in *[!0-9]*) m=$(grep -E '^- \[( |x|~)\] ' "$file" 2>/dev/null | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g' | grep -n -x -F -- "$n" | head -n 1 | cut -d: -f1)
+      [ -n "$m" ] || { echo "No item \"$n\"" >&2; exit 1; }; n=$m ;; esac
+    "$0" -p "$folder" "_open" "$n" ;;
+  _doing) edit "${1:?item number}" 's/^- \[[ x]\] /- [~] /; s/ *<!-- done: [^>]* -->//' ;;
+  _open) edit "${1:?item number}" 's/^- \[[ x~]\] /- [ ] /; s/ *<!-- done: [^>]* -->//' ;;
   edit|reword)
     n=${1:?item number or text}; shift
     new=$(printf '%s' "$*" | tr '\n' ' ' | sed 's/  *$//')
     [ -n "$new" ] || { echo "usage: todo edit <n|text> <new text>" >&2; exit 2; }
-    case "$n" in *[!0-9]*) m=$(grep -E '^- \[( |x)\] ' "$file" 2>/dev/null | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g' | grep -n -x -F -- "$n" | head -n 1 | cut -d: -f1)
+    case "$n" in *[!0-9]*) m=$(grep -E '^- \[( |x|~)\] ' "$file" 2>/dev/null | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g' | grep -n -x -F -- "$n" | head -n 1 | cut -d: -f1)
       [ -n "$m" ] || { echo "No item \"$n\"" >&2; exit 1; }; n=$m ;; esac
-    old=$(grep -E '^- \[( |x)\] ' "$file" 2>/dev/null | sed -n "${n}p" | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g')
+    old=$(grep -E '^- \[( |x|~)\] ' "$file" 2>/dev/null | sed -n "${n}p" | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g')
     [ -n "$old" ] || { echo "No item $n" >&2; exit 1; }
     # The new text, safe for sed's replacement (\, & and the | delimiter).
     esc=$(printf '%s' "$new" | sed 's/[\\&|]/\\&/g')
@@ -156,7 +198,7 @@ case "$cmd" in
     if [ "$cmd" = log ]; then opt log && echo "Request logging: on" || echo "Request logging: off"
     else opt sync && echo "TODO.md sync: on" || echo "TODO.md sync: off"; fi ;;
   rm|delete)
-    text=$(grep -E '^- \[( |x)\] ' "$file" 2>/dev/null | sed -n "${1:?item number}p" | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g')
+    text=$(grep -E '^- \[( |x|~)\] ' "$file" 2>/dev/null | sed -n "${1:?item number}p" | sed 's/^- \[.\] //; s/ *<!--[^>]*-->//g')
     edit "$1" 'd'
     [ -n "$text" ] && md rm "$text" ;;
   clear) [ -f "$file" ] && { grep -v -E '^- \[x\] ' "$file" > "$file.tmp"; mv "$file.tmp" "$file"; } ;;
