@@ -947,7 +947,7 @@ export default class Todos extends View {
           }))
         .child(editing
           ? Input.new(this.editInput).flex_1().h(24).px(6).rounded(5).border_1().border_color(t.accent).bg(t.background).text_size(13).text_color(t.foreground)
-          : div().id(`text-${key}`).flex_1().min_w(0).text_size(13).line_height("18px").text_color(x.done ? t.dim : t.foreground).when(x.done, (el) => el.line_through())
+          : div().id(`text-${key}`).flex_1().min_w(0).text_size(13).line_height("18px").text_color(x.done ? t.dim : t.foreground)
             .when(!hovered, (el) => el.truncate()).when(hovered, (el) => el.whitespace_normal().py(5))
             .on_click((e, cx) => { if (e.click_count === 2 && !multi(e)) { this.editing = { slug: x.slug, i: x.i }; this.editInput.set_value(x.text + (x.due ? ` @${fmtDate(new Date(`${x.due.split(" ")[0]}T00:00:00`))}${x.due.includes(" ") ? ` ${fmtTime(x.due.split(" ")[1])}` : ""}` : "")); this.editInput.focus(); cx.notify(); } })
             .child(x.text))
