@@ -726,8 +726,19 @@ export default class Todos extends View {
     this.fileAt[folder] = Date.now();
     this.fromFile[folder] ??= { file: null, items: [] };
     cx.spawn(async (cx) => {
-      const r = await exec("sh", ["-c", TODO_FILE, "sh", folder], onM(mOf(folder))).catch(() => null);
-      const out = r?.stdout ?? "", nl = out.indexOf("\n");
+      let out = "";
+      const m = mOf(folder);
+      if (m) {
+        const r = await exec("sh", ["-c", TODO_FILE, "sh", folder], onM(m)).catch(() => null);
+        out = r?.stdout ?? "";
+      } else {
+        const fp = folder.replace(/^\/([a-zA-Z])(?=\/)/, (_m, d) => `${d.toUpperCase()}:`);
+        for (const f of ["TODO.md", "todo.md", "Todo.md", "TODO", "TODO.txt", "docs/TODO.md"]) {
+          const text = await fs.readFile(`${fp}/${f}`, "utf8").catch(() => null);
+          if (text != null) { out = `${f}\n${text.slice(0, 65536)}`; break; }
+        }
+      }
+      const nl = out.indexOf("\n");
       const next = nl > 0 ? { file: out.slice(0, nl), items: fileItems(out.slice(nl + 1)) } : { file: null, items: [] };
       const was = this.fileStale[folder];
       this.fileStale[folder] = false;
