@@ -11,6 +11,7 @@
 #   todo log [on|off]        this project: agents add what you ask for (default: Options › To-do)
 #   todo sync [on|off]       this project: its TODO.md follows add/edit/rm (default: Options › To-do)
 #   todo --rule on|off       add or remove the agents' to-do rule (CLAUDE.md, AGENTS.md)
+#   todo personal …          your own list, not a project's (~/.todo → personal.md)
 # -p <folder> (first) picks the project; otherwise it's the git repo this runs in
 # (its main checkout for a worktree), else this folder.
 # Each list is ~/.local/share/over9k/todos/<slug>.md (DIR): a "<!-- folder: … -->"
@@ -59,6 +60,8 @@ PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
 dir=$DIR
 mkdir -p "$dir"
 folder=""
+# `todo personal …` is `-p ~/.todo`: one fixed list file, personal.md.
+if [ "$1" = "personal" ]; then shift; mkdir -p "$HOME/.todo"; set -- -p "$HOME/.todo" "$@"; fi
 if [ "$1" = "-p" ]; then folder=$(cd "$2" && pwd); shift 2; fi
 if [ -z "$folder" ]; then
   common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
@@ -78,6 +81,10 @@ opt() {
 md() { [ -n "$PY" ] && opt sync && "$PY" -I "$HERE/todo-cross.py" "$folder" "$@" 2>/dev/null || true; }
 slug=$(printf %s "$folder" | sed 's/[^A-Za-z0-9][^A-Za-z0-9]*/-/g; s/^-//; s/-$//')
 file="$dir/$slug.md"
+# ~/.todo (however pwd spelled it) is the personal list: one fixed file, so the
+# panel's "personal" key and `todo personal` always meet in personal.md.
+pslug=$(printf %s "$HOME/.todo" | sed 's/[^A-Za-z0-9][^A-Za-z0-9]*/-/g; s/^-//; s/-$//' | tr 'A-Z' 'a-z')
+if [ "$(printf %s "$slug" | tr 'A-Z' 'a-z')" = "$pslug" ]; then file="$dir/personal.md"; fi
 
 items() { [ -f "$1" ] && grep -E '^- \[( |x)\] ' "$1" || true; }
 show() {
@@ -153,5 +160,5 @@ case "$cmd" in
     edit "$1" 'd'
     [ -n "$text" ] && md rm "$text" ;;
   clear) [ -f "$file" ] && { grep -v -E '^- \[x\] ' "$file" > "$file.tmp"; mv "$file.tmp" "$file"; } ;;
-  *) sed -n '2,12s/^# \{0,1\}//p' "$SELF"; exit 2 ;;
+  *) sed -n '2,14s/^# \{0,1\}//p' "$SELF"; exit 2 ;;
 esac

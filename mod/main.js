@@ -68,8 +68,18 @@ const mOf = (folder) => {
   return FOLDER_M.get(folder.replace(/\/+$/, "")) ?? null;
 };
 const onM = (m) => (m ? { on: m } : {});
+// Personal to-dos: not a project — ~/.todo's list (personal.md in DIR), local
+// only, for things like "meeting at 3". `todo personal` writes the same file.
+const PERSONAL = () => `${home()}/.todo`;
+let personalSlug = null;
+const isPersonal = (folder) => {
+  if (!folder) return false;
+  personalSlug ??= slugOf(PERSONAL()).toLowerCase();
+  return slugOf(String(folder).replace(/\/+$/, "")).toLowerCase() === personalSlug;
+};
 // A list there is keyed "@<machine>:<slug>"; this computer's by its slug alone.
-const keyOf = (folder) => (mOf(folder) ? `@${mOf(folder)}:${slugOf(folder)}` : slugOf(folder));
+// The personal list's slug is fixed: "personal", whatever its folder string.
+const keyOf = (folder) => (isPersonal(folder) ? "personal" : mOf(folder) ? `@${mOf(folder)}:${slugOf(folder)}` : slugOf(folder));
 const machineOf = (key) => (key.startsWith("@") ? key.slice(1, key.indexOf(":")) : null);
 // There, the list is read and written with sh (todo.sh's folder): a write only
 // when the file still holds what was read ($3; $4 set: it was there), else 3.
@@ -496,8 +506,10 @@ export default class Todos extends View {
       const raw = await readTextFile(`${DIR()}/${f}`).catch(() => null);
       if (raw == null) continue;
       const { folder, items, skipped, opts } = parse(raw);
-      if (folder) lists[f.slice(0, -3)] = { folder, items, skipped, opts, raw };
+      if (folder) lists[f.slice(0, -3)] = { folder: isPersonal(folder) ? PERSONAL() : folder, items, skipped, opts, raw };
     }
+    // The personal list exists even before its first item (its chip shows 0).
+    lists.personal ??= { folder: PERSONAL(), items: [], skipped: [], opts: defOpts(), raw: null };
     // A list that changed: its TODO.md is read again before suggesting from it
     // (an agent's edit reaches TODO.md a moment after the list).
     for (const [slug, l] of Object.entries(lists)) if (this.lists?.[slug]?.raw !== l.raw) { this.fileAt[l.folder] = 0; this.fileStale[l.folder] = true; }
@@ -613,10 +625,12 @@ export default class Todos extends View {
   }
 
   name(folder) {
+    if (isPersonal(folder)) return "Personal";
     if (folder === home()) return "~";
     return (shared("projects.names") ?? {})[folder] || folder.split("/").pop();
   }
   color(folder, t) {
+    if (isPersonal(folder)) return t.accent;
     return folder === home() ? t.muted : hue(folder.split("/").pop());
   }
 
@@ -883,7 +897,7 @@ export default class Todos extends View {
     const pinList = shared("projects.pinned");
     const pinned = new Set((pinList ?? []).map((f) => f.replace(/\/+$/, "")));
     const hereOk = Boolean(this.here && this.here !== home());
-    const inScope = (l) => l.machine || !Array.isArray(pinList) || pinned.has(l.folder) || (hereOk && l.folder === this.here);
+    const inScope = (l) => l.machine || isPersonal(l.folder) || !Array.isArray(pinList) || pinned.has(l.folder) || (hereOk && l.folder === this.here);
     if (this.proj && !this.lists[this.proj]) this.proj = null;
     this.filter = this.proj ?? (this.mode === "here" && hereOk ? hereSlug : null);
     const all = Object.entries(this.lists).filter(([, l]) => inScope(l)).flatMap(([slug, l]) => l.items.map((x, i) => ({ ...x, slug, i, folder: l.folder })));
@@ -892,9 +906,11 @@ export default class Todos extends View {
     // open count, so an all-done project still gets one to look back at.
     const bySlug = {};
     for (const x of all) { const b = bySlug[x.slug] ??= { open: 0, n: 0 }; b.n++; if (!x.done) b.open++; }
-    const projects = Object.keys(bySlug).filter((s) => !(hereOk && s === hereSlug))
+    const projects = Object.keys(bySlug).filter((s) => s !== "personal" && !(hereOk && s === hereSlug))
       .map((s) => { const l = this.lists[s], m = machineOf(s); return { slug: s, folder: l.folder, label: `${m ? `${m}/` : ""}${this.name(l.folder)}`, n: bySlug[s].open, color: this.color(l.folder, t) }; })
       .sort((a, b) => a.label.localeCompare(b.label));
+    // Personal (~/.todo) is yours, not a project's: its chip always shows.
+    projects.unshift({ slug: "personal", folder: PERSONAL(), label: "Personal", n: bySlug.personal?.open ?? 0, color: t.accent });
     const hereOpen = hereOk ? (this.lists[hereSlug]?.items ?? []).filter((x) => !x.done).length : 0;
     const shown = (list) => list.filter((x) => !this.filter || x.slug === this.filter);
     const dueKey = (x) => (x.due ? x.due.padEnd(16, " ") : "~");
