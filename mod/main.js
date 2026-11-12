@@ -16,7 +16,7 @@
 // sidebar's: a hash of its folder's name) and "All"; one list, the project
 // you're in first, then by due time; each to-do with its project and when it's
 // due (red once past); "Doing" ([~]: being worked on, `todo doing`) and
-// "Done today". Adding: to the project you're in, or
+// "Done". Adding: to the project you're in, or
 // "#name" for another; "@today" / "@fri" / "@nextweek" / "@in2h" / "@12nov" / "@4/11"
 // (day and month in the computer's order; every form is listed above readWhen), with a time
 // ("@14:30", "@fri 9am") or not. A circle ticks; double-click edits; × deletes.
@@ -55,6 +55,17 @@ import { theme, exec, home, appHome, spaces, machines, focused, shared, readText
 let PY = null;
 const python = (args) => (PY ??= exec("python3", ["-c", "1"]).then((r) => (r?.code === 0 ? "python3" : "python"), () => "python"))
   .then((p) => exec(p, args));
+// gpui-shell's fs module may read under home but only write under appHome.
+// Create list folders through the user's environment when fs.mkdir is denied.
+const ensureLocalDir = async (path) => {
+  try { await fs.mkdir(path, { recursive: true }); return true; } catch {}
+  // Existing folders remain readable even when gpui-shell denies writes.
+  try { await fs.readdir(path); return true; } catch {}
+  const r = await python(["-c", "import os, sys; os.makedirs(sys.argv[1], exist_ok=True)", path]).catch(() => null);
+  if (r?.code === 0) return true;
+  console.log(`To-do: could not create ${path}: ${r?.stderr?.trim() || "Python unavailable"}`);
+  return false;
+};
 
 // Where the lists live: the same folder todo.sh uses. Resolved once at start
 // (dataDir), from $XDG_DATA_HOME when the user's environment sets it.
@@ -62,6 +73,14 @@ const DATA_DIR = ".local/share/over9k/todos"; // under home
 const XDG_DIR = 'printf %s "${XDG_DATA_HOME:+$XDG_DATA_HOME/over9k/todos}"';
 let dataDir = null;
 const DIR = () => dataDir ?? `${home()}/${DATA_DIR}`;
+const localDataDir = async () => {
+  const sh = await exec("sh", ["-c", XDG_DIR]).catch(() => null);
+  if (sh?.code === 0) return sh.stdout.trim() || null;
+  // A Windows host can run Herdr through cmd without Git Bash on PATH.
+  const py = await python(["-c", "import os; print(os.environ.get('XDG_DATA_HOME', ''))"]).catch(() => null);
+  const xdg = py?.code === 0 ? py.stdout.trim().replace(/[\\/]+$/, "") : "";
+  return xdg ? `${xdg}/over9k/todos` : null;
+};
 // Crosses a to-do out of (or back into) a project's own TODO.md.
 const CROSS = () => `${appHome()}/mods/over9k-todos/todo-cross.py`;
 // The project you're in when its space is on another computer: its list, its
@@ -506,10 +525,10 @@ export default class Todos extends View {
     this.editInput.on("submit", (_e, cx) => this.saveEdit(cx));
     this.editInput.on("blur", (_e, cx) => this.saveEdit(cx));
     cx.spawn(async (cx) => {
-      dataDir = (await exec("sh", ["-c", XDG_DIR]).catch(() => null))?.stdout.trim() || null;
-      await fs.mkdir(DIR(), { recursive: true }).catch(() => null);
+      dataDir = await localDataDir();
+      await ensureLocalDir(DIR());
       myId = await machineId();
-      await fs.mkdir(PERSONAL(), { recursive: true }).catch(() => null);
+      await ensureLocalDir(PERSONAL());
       await this.load(cx);
       await this.loadRemote(cx);
       this.booted = true; // the card's "gone" vs "still loading" line
@@ -632,30 +651,25 @@ export default class Todos extends View {
 
   // The `todo` command and its helpers on every computer: agents there run
   // the same todo.sh (~/.local/share/over9k-todos — what ~/.local/bin/todo
-  // execs), so a machine whose copy differs gets this one's, whole. cksum
-  // fingerprints, checked at most once a minute alongside the lists' read.
+  // execs), so a machine whose copy differs gets this one's, whole. Compare
+  // the small files' text without a local shell, at most once a minute.
   async syncTodoTools(cx) {
     const now = Date.now();
     if (now - (this.toolsAt ?? 0) < 60000) return;
     this.toolsAt = now;
     const dir = `${appHome().replace(/\\/g, "/")}/mods/over9k-todos`;
     const files = ["todo.sh", "todo-cross.py"];
-    const local = {};
-    for (const f of files) {
-      const sum = await exec("sh", ["-c", "cksum \"$1\" | cut -d' ' -f1", "sh", `${dir}/${f}`]).catch(() => null);
-      if (sum?.code === 0) local[f] = sum.stdout.trim();
-    }
+    const local = await Promise.all(files.map((f) => readTextFile(`${dir}/${f}`).catch(() => null)));
     const ms = this.remoteMachines ?? [];
-    if (!Object.keys(local).length || !ms.length) return;
+    if (!local.some((text) => text != null) || !ms.length) return;
     await Promise.all(ms.map(async (m) => {
-      const res = await exec("sh", ["-c",
-        'for f in "$@"; do p="$HOME/.local/share/over9k-todos/$f"; if [ -f "$p" ]; then cksum "$p" | cut -d" " -f1; else echo missing; fi; done',
-        "sh", ...files], onM(m)).catch(() => null);
-      if (res?.code !== 0) return;
-      const remote = res.stdout.trim().split("\n");
       await Promise.all(files.map(async (f, i) => {
-        const text = await readTextFile(`${dir}/${f}`).catch(() => null);
-        if (text == null || remote[i] === local[f]) return;
+        const text = local[i];
+        if (text == null) return;
+        const res = await exec("sh", ["-c",
+          'p="$HOME/.local/share/over9k-todos/$1"; if [ -f "$p" ]; then cat "$p"; else exit 3; fi',
+          "sh", f], onM(m)).catch(() => null);
+        if (!res || (res.code !== 0 && res.code !== 3) || (res.code === 0 && res.stdout === text)) return;
         await exec("sh", ["-c",
           'd="$HOME/.local/share/over9k-todos"; mkdir -p "$d" && printf %s "$1" > "$d/$2.tmp" && mv "$d/$2.tmp" "$d/$2" && chmod +x "$d/$2"',
           "sh", text, f], onM(m)).catch(() => null);
@@ -1071,14 +1085,26 @@ export default class Todos extends View {
     const pinned = new Set((pinList ?? []).map((f) => f.replace(/\/+$/, "")));
     const hereOk = Boolean(this.here && this.here !== home());
     const inScope = (l) => l.machine || isPersonal(l.folder) || !Array.isArray(pinList) || pinned.has(l.folder) || (hereOk && l.folder === this.here);
+    // A Doing parent owns its whole subtree on screen. Children retain their
+    // own checkbox state, but stay under that parent until it leaves Doing.
+    const buckets = {};
+    for (const [slug, l] of Object.entries(this.lists)) {
+      const stack = [];
+      buckets[slug] = l.items.map((x) => {
+        const depth = x.depth ?? 0;
+        while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop();
+        const underDoing = (stack[stack.length - 1]?.underDoing ?? false) || (x.doing && !x.done);
+        stack.push({ depth, underDoing });
+        return underDoing ? "doing" : x.done ? "done" : "todo";
+      });
+    }
+    const bucket = (x) => buckets[x.slug]?.[x.i];
     const all = Object.entries(this.lists).filter(([, l]) => inScope(l)).flatMap(([slug, l]) => l.items.map((x, i) => ({ ...x, slug, i, folder: l.folder })));
-    // Done is today only (as its name says): older ticked items stay in the
-    // file for `todo clear`, they just don't crowd the panel.
-    const open = all.filter((x) => !x.done && !x.doing), doings = all.filter((x) => x.doing && !x.done), doneToday = all.filter((x) => x.done && (x.doneOn ?? "").startsWith(today())).sort((a, b) => (b.doneOn ?? "").localeCompare(a.doneOn ?? ""));
+    const open = all.filter((x) => bucket(x) === "todo"), doings = all.filter((x) => bucket(x) === "doing"), completed = all.filter((x) => bucket(x) === "done").sort((a, b) => (b.doneOn ?? "").localeCompare(a.doneOn ?? ""));
     // A chip per project with items shown in the panel (the one you're in has
-    // its own). Older done items remain in files but have no visible row.
+    // its own). Completed items keep their project visible until cleared.
     const bySlug = {};
-    for (const x of [...open, ...doings, ...doneToday]) { const b = bySlug[x.slug] ??= { open: 0, n: 0 }; b.n++; if (!x.done) b.open++; }
+    for (const x of [...open, ...doings, ...completed]) { const b = bySlug[x.slug] ??= { open: 0, n: 0 }; b.n++; if (!x.done) b.open++; }
     // A category exists only while its list has items. Drop a selected chip
     // once its last item is removed; "here" falls back to All when empty.
     if (this.proj && !bySlug[this.proj]) this.proj = null;
@@ -1091,7 +1117,7 @@ export default class Todos extends View {
     const hereOpen = hereOk ? (this.lists[hereSlug]?.items ?? []).filter((x) => !x.done).length : 0;
     const shown = (list) => list.filter((x) => !this.filter || x.slug === this.filter);
     const dueKey = (x) => (x.due ? x.due.padEnd(16, " ") : "~");
-    const done = shown(doneToday);
+    const done = shown(completed);
     // The lists as trees (the file's 2-space indents): a section keeps a node
     // when it matches and its children follow it; a node whose parent isn't in
     // the section (done, while it stays open) is promoted to the nearest shown
@@ -1104,7 +1130,7 @@ export default class Todos extends View {
         l.items.forEach((x, i) => {
           const fd = x.depth ?? 0;
           while (stack.length && stack[stack.length - 1].fd >= fd) stack.pop();
-          if (!pred(x)) return;
+          if (!pred(x, slug, i)) return;
           const parent = stack[stack.length - 1];
           const node = { x: { ...x, slug, i, folder: l.folder, _d: parent ? parent.d + 1 : 0, _key: `${slug}:${i}` }, fd, d: parent ? parent.d + 1 : 0, kids: [] };
           (parent ? parent.kids : roots).push(node);
@@ -1118,9 +1144,9 @@ export default class Todos extends View {
     const byDue = (a, b) => (b.x.slug === hereSlug) - (a.x.slug === hereSlug) || dueKey(a.x).localeCompare(dueKey(b.x)) || a.x.slug.localeCompare(b.x.slug) || a.x.i - b.x.i;
     const byDone = (a, b) => (b.x.doneOn ?? "").localeCompare(a.x.doneOn ?? "") || a.x.i - b.x.i;
     const flatten = (nodes) => nodes.flatMap((n) => (this.folded.has(n.x._key) ? [n] : [n, ...flatten(n.kids)]));
-    const todoFlat = flatten(forest((x) => !x.done && !x.doing).sort(byDue));
-    const doingFlat = flatten(forest((x) => x.doing && !x.done).sort(byDue));
-    const doneFlat = flatten(forest((x) => x.done).sort(byDone));
+    const todoFlat = flatten(forest((_x, slug, i) => buckets[slug][i] === "todo").sort(byDue));
+    const doingFlat = flatten(forest((_x, slug, i) => buckets[slug][i] === "doing").sort(byDue));
+    const doneFlat = flatten(forest((_x, slug, i) => buckets[slug][i] === "done").sort(byDone));
     this.visible = [...doingFlat, ...todoFlat, ...doneFlat].map((n) => n.x);
     const nOpen = shown(open).length, nDoing = shown(doings).length;
     const picks = this.picked();
@@ -1484,8 +1510,6 @@ export default class Todos extends View {
       .child(v_flex().id("todo-scroll").flex_1().min_h(0).overflow_y_scrollbar().px(8).pb(8)
         .child(section("todo", "To-do", nOpen, !this.todoFolded, () => { this.todoFolded = !this.todoFolded; }, null, { color: t.accent }))
         .when(!this.todoFolded, (el) => el.children(todoFlat.flatMap((n) => withStarter(n.x))))
-        .when(!nOpen, (el) => el.child(div().px(8).py(6).text_size(12).text_color(t.dim)
-          .child(this.filter ? "Nothing left here" : `Nothing to do. New ones go to Personal (or pick a project with #).`)))
         // Doing: being worked on ([~] in the file); a row's clock button toggles it.
         .child(section("doing", "Doing", nDoing, !this.doingFolded, () => { this.doingFolded = !this.doingFolded; }, null, { color: t.working }))
         .when(!this.doingFolded, (el) => el.children(doingFlat.flatMap((n) => withStarter(n.x))))
@@ -1508,19 +1532,24 @@ export default class Todos extends View {
               .hover((x) => x.bg(t.raised)).tooltip(`Delete from ${fromFile.file ?? "TODO.md"}`).on_click((_e, cx) => this.dropFromFile(focusFolder, text, cx))
               .child(svg("mods/workspace-chrome/x.svg").size(11).text_color(t.muted)))),
             ...(this.startFor === `file:${i}` ? [starter({ text, folder: focusFolder }, (a, cx, running) => this.startFromFile(a, focusFolder, text, cx, running))] : [])])))
-        // Done: today's ticked ones (the list scrolls), and Clear (twice) to
-        // delete them — older ticked ones stay for `todo clear`.
-        .when(done.length > 0, (el) => el
-          .child(section("done", "Done", done.length, !this.doneFolded, () => { this.doneFolded = !this.doneFolded; },
+        // Done stays visible, including completed items from earlier days.
+        .child(section("done", "Done", done.length, !this.doneFolded, () => { this.doneFolded = !this.doneFolded; },
+            done.length > 0 ?
             div().id("done-clear").px(5).rounded(4).cursor_pointer().text_color(this.clearArmed ? t.ansi1 : t.dim).hover((s) => s.bg(t.raised).text_color(t.foreground))
               .on_click((_e, cx) => {
                 cx.stop_propagation();
                 if (!this.clearArmed) { this.clearArmed = true; cx.spawn(async (cx) => { await cx.sleep(3000); this.clearArmed = false; cx.notify(); }); }
-                else { this.clearArmed = false; for (const slug of new Set(done.map((x) => x.slug))) this.change(slug, (items) => items.filter((y) => !y.done || !(y.doneOn ?? "").startsWith(today())), cx); }
+                else {
+                  this.clearArmed = false;
+                  for (const slug of new Set(done.map((x) => x.slug))) {
+                    const indices = new Set(done.filter((x) => x.slug === slug).map((x) => x.i));
+                    this.change(slug, (items) => items.filter((_, i) => !indices.has(i)), cx);
+                  }
+                }
                 cx.notify();
               })
-              .child(this.clearArmed ? `Clear ${done.length}?` : "Clear"),
+              .child(this.clearArmed ? `Clear ${done.length}?` : "Clear") : null,
             { color: t.done }))
-          .children(this.doneFolded ? [] : doneFlat.map((n) => row(n.x)))));
+        .children(this.doneFolded ? [] : doneFlat.map((n) => row(n.x))));
   }
 }
