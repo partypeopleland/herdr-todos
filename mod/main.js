@@ -48,6 +48,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { agentTask } from "./agent-name.js";
+import * as fs from "fs/promises";
 import { theme, exec, home, appHome, spaces, machines, focused, shared, readTextFile, writeTextFile, watchFolder, knownAgents, run, notify, panes, hc, agents, setShared, terminals, openOverlay, closeOverlay, props } from "herdr";
 
 // Python 3 runs as "python3", else "python" (as on Windows): found once.
@@ -81,8 +82,9 @@ const onM = (m) => (m ? { on: m } : {});
 // file; other machines' copies pushed here keep their names (read-only there).
 const PERSONAL = () => `${home()}/.todo`;
 let myId = null, idP = null;
-const machineId = () => (idP ??= exec("sh", ["-c", "hostname | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9-]/-/g'"])
-  .then((r) => r?.stdout.trim() || "unknown", () => "unknown"));
+const machineId = () => (idP ??= exec("hostname", []).then(
+  (r) => r?.stdout.trim().toLowerCase().replace(/[^a-z0-9-]/g, "-") || "unknown",
+  () => "unknown"));
 const PFILE = () => `${PERSONAL()}/todo-${myId}.md`;
 let personalSlug = null;
 const isPersonal = (folder) => {
@@ -505,9 +507,9 @@ export default class Todos extends View {
     this.editInput.on("blur", (_e, cx) => this.saveEdit(cx));
     cx.spawn(async (cx) => {
       dataDir = (await exec("sh", ["-c", XDG_DIR]).catch(() => null))?.stdout.trim() || null;
-      await exec("mkdir", ["-p", DIR()]).catch(() => null);
+      await fs.mkdir(DIR(), { recursive: true }).catch(() => null);
       myId = await machineId();
-      await exec("mkdir", ["-p", PERSONAL()]).catch(() => null);
+      await fs.mkdir(PERSONAL(), { recursive: true }).catch(() => null);
       await this.load(cx);
       await this.loadRemote(cx);
       this.booted = true; // the card's "gone" vs "still loading" line
@@ -547,9 +549,9 @@ export default class Todos extends View {
   }
 
   async load(cx) {
-    const r = await exec("ls", ["-1", DIR()]).catch(() => null);
+    const names = await fs.readdir(DIR()).catch(() => []);
     const lists = {};
-    for (const f of (r?.stdout ?? "").split("\n").filter((x) => x.endsWith(".md"))) {
+    for (const f of names.filter((x) => x.endsWith(".md"))) {
       const raw = await readTextFile(`${DIR()}/${f}`).catch(() => null);
       if (raw == null) continue;
       const { folder, items, skipped, opts } = parse(raw);
@@ -716,9 +718,19 @@ export default class Todos extends View {
     if (`${m}|${from}` === this.hereFrom) return;
     this.hereFrom = `${m}|${from}`;
     cx.spawn(async (cx) => {
-      const r = from ? await exec("sh", ["-c", 'c=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); case "$c" in */.git) echo "${c%/.git}" ;; *) git -C "$1" rev-parse --show-toplevel 2>/dev/null || echo "$1" ;; esac; printf "%s\\n" "$HOME"', "sh", from], onM(m)).catch(() => null) : null;
+      let top = "", theirHome = "";
+      if (from) {
+        if (m) {
+          const r = await exec("sh", ["-c", 'c=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); case "$c" in */.git) echo "${c%/.git}" ;; *) git -C "$1" rev-parse --show-toplevel 2>/dev/null || echo "$1" ;; esac; printf "%s\\n" "$HOME"', "sh", from], onM(m)).catch(() => null);
+          [top, theirHome] = (r?.stdout ?? "").split("\n");
+        } else {
+          const g = await exec("git", ["-C", from, "rev-parse", "--path-format=absolute", "--git-common-dir"]).catch(() => null);
+          const c = g?.stdout?.trim() ?? "";
+          if (/[\\/]\.git$/.test(c)) top = c.replace(/[\\/]\.git$/, "");
+          else top = (await exec("git", ["-C", from, "rev-parse", "--show-toplevel"]).catch(() => null))?.stdout?.trim() || from;
+        }
+      }
       if (this.hereFrom !== `${m}|${from}`) return; // moved on meanwhile
-      const [top, theirHome] = (r?.stdout ?? "").split("\n");
       let here = (top?.trim() || from).replace(/\/+$/, "") || null;
       if (m && (!here || here === (theirHome ?? "").trim().replace(/\/+$/, ""))) here = null;
       if (here === this.here && m === HERE.machine) return;
@@ -780,8 +792,19 @@ export default class Todos extends View {
     this.fileAt[folder] = Date.now();
     this.fromFile[folder] ??= { file: null, items: [] };
     cx.spawn(async (cx) => {
-      const r = await exec("sh", ["-c", TODO_FILE, "sh", folder], onM(mOf(folder))).catch(() => null);
-      const out = r?.stdout ?? "", nl = out.indexOf("\n");
+      let out = "";
+      const m = mOf(folder);
+      if (m) {
+        const r = await exec("sh", ["-c", TODO_FILE, "sh", folder], onM(m)).catch(() => null);
+        out = r?.stdout ?? "";
+      } else {
+        const fp = folder.replace(/^\/([a-zA-Z])(?=\/)/, (_m, d) => `${d.toUpperCase()}:`);
+        for (const f of ["TODO.md", "todo.md", "Todo.md", "TODO", "TODO.txt", "docs/TODO.md"]) {
+          const text = await fs.readFile(`${fp}/${f}`, "utf8").catch(() => null);
+          if (text != null) { out = `${f}\n${text.slice(0, 65536)}`; break; }
+        }
+      }
+      const nl = out.indexOf("\n");
       const next = nl > 0 ? { file: out.slice(0, nl), items: fileItems(out.slice(nl + 1)) } : { file: null, items: [] };
       const was = this.fileStale[folder];
       this.fileStale[folder] = false;
