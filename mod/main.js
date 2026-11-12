@@ -877,12 +877,16 @@ export default class Todos extends View {
   // it into sub-todos, after my confirmation).
   taskFor(x, kind = "run") {
     const xs = [x].flat(), when = (y) => (y.due ? ` (due ${dueWords(y.due)})` : "");
-    const tick = (y) => `\`todo done "${y.text.replace(/"/g, '\\"')}"\``;
-    const q = (y) => `"${y.text.replace(/"/g, '\\"')}"`;
-    if (xs.length === 1 && kind === "plan") return `I want to plan this to-do with you before any work starts: ${q(xs[0])}${when(xs[0])}\n\nTalk it through first — ask what you need to know and propose an approach. Don't start implementing until I say go. When we agree on the approach, save a one-line summary of it on the to-do itself so it survives this conversation and the next agent sees it — a headline, not the discussion: \`todo note ${q(xs[0])} "<summary>"\` (it's trimmed past ~140 characters).`;
-    if (xs.length === 1 && kind === "wbs") return `Break this to-do into sub-tasks (a work breakdown). It's ${q(xs[0])}${when(xs[0])} in the project's todo list.\n\nThe deliverable is the breakdown itself — child items under it in the todo list — not the work. Don't ask whether to start or how to execute; we'll dispatch the children later, one by one. If the item has a note (the agreed plan), treat it as the spec.\n\nPropose the breakdown first and wait for my confirmation. Once I confirm, add each sub-task as a child of it: \`todo add --under ${q(xs[0])} "<sub-task>"\` — keep each a short one-liner; nest deeper levels the same way.`;
-    if (xs.length === 1) return `Work on this one to-do from the project's list, and only this one: ${xs[0].text}${when(xs[0])}\n\nIts note, if it has one, is the agreed plan — follow it. When it's finished, tick it: ${tick(xs[0])}.`;
-    return `Work on these to-dos from the project's list, and only these:\n\n${xs.map((y, i) => `${i + 1}. ${y.text}${when(y)}`).join("\n")}\n\nTick each one once it's finished: ${xs.map(tick).join(", ")}.`;
+    const q = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
+    // An existing conversation can live in a different folder from the item.
+    // Always name the list so note, child creation and completion go to it.
+    const todo = (y) => isPersonal(y.folder) ? "todo personal" : `todo -p ${q(y.folder)}`;
+    const tick = (y) => `\`${todo(y)} done ${q(y.text)}\``;
+    const target = (y) => isPersonal(y.folder) ? "Personal list" : "project's list";
+    if (xs.length === 1 && kind === "plan") return `I want to plan this to-do with you before any work starts: ${q(xs[0].text)}${when(xs[0])}\n\nTalk it through first — ask what you need to know and propose an approach. Don't start implementing until I say go. When we agree on the approach, save a one-line summary of it on the to-do itself so it survives this conversation and the next agent sees it — a headline, not the discussion: \`${todo(xs[0])} note ${q(xs[0].text)} "<summary>"\` (it's trimmed past ~140 characters).`;
+    if (xs.length === 1 && kind === "wbs") return `Break this to-do into sub-tasks (a work breakdown). It's ${q(xs[0].text)}${when(xs[0])} in the ${target(xs[0])}.\n\nThe deliverable is the breakdown itself — child items under it in the todo list — not the work. Don't ask whether to start or how to execute; we'll dispatch the children later, one by one. If the item has a note (the agreed plan), treat it as the spec.\n\nPropose the breakdown first and wait for my confirmation. Once I confirm, add each sub-task as a child of it: \`${todo(xs[0])} add --under ${q(xs[0].text)} "<sub-task>"\` — keep each a short one-liner; nest deeper levels the same way.`;
+    if (xs.length === 1) return `Work on this one to-do from the ${target(xs[0])}, and only this one: ${xs[0].text}${when(xs[0])}\n\nIts note, if it has one, is the agreed plan — follow it. When it's finished, tick it: ${tick(xs[0])}.`;
+    return `Work on these to-dos from their lists, and only these:\n\n${xs.map((y, i) => `${i + 1}. ${y.text}${when(y)}`).join("\n")}\n\nTick each one once it's finished: ${xs.map(tick).join(", ")}.`;
   }
 
   // The picked to-dos as they are now (by their text: an agent may have moved them).
@@ -976,6 +980,45 @@ export default class Todos extends View {
       return fg && agentCmds.has(fg) && !shells.has(fg);
     }).map((p) => ({ address: p.terminal, pane: p.pane, status: p.status ?? "idle", app: p.app, program: p.program, title: p.title, tab_name: "" }))
       .sort((a, b) => (b.address === this.lastAgent) - (a.address === this.lastAgent));
+  }
+
+  // The agent the person is using now may be outside the to-do's project
+  // (especially for Personal). A card is another View, so its opener passes
+  // the address it saw before the card took focus.
+  currentChat(captured = null) {
+    const f = focused(), as = agents();
+    const inSpace = as.filter((a) => a.space === f?.space);
+    const sole = f?.space ? (inSpace.length === 1 ? inSpace[0] : null)
+      : (as.length === 1 ? as[0] : null);
+    const candidates = [captured, f?.agent, as.find((a) => a.focused)?.address,
+      f?.terminal, panes().find((p) => p.focused)?.terminal, sole?.address];
+    for (const address of candidates) {
+      if (!address) continue;
+      const a = as.find((x) => x.address === address);
+      if (a) return a;
+      const p = panes().find((x) => x.terminal === address);
+      if (p && (p.status || p.app || (p.program?.agent && !p.program?.shell))) {
+        return { address, pane: p.pane, status: p.status ?? "idle", app: p.app,
+          program: p.program, title: p.title, tab_name: "" };
+      }
+    }
+    return null;
+  }
+
+  chatMachine(a) {
+    const p = panes().find((x) => x.terminal === a.address);
+    const space = a.space ? spaces().find((s) => s.id === a.space)
+      : spaces().find((s) => (s.tabs ?? []).some((t) => t.id === p?.tab));
+    return space ? (space.machine ?? null) : undefined;
+  }
+
+  conversationChoices(x, captured = null) {
+    const candidate = this.currentChat(captured);
+    // A local conversation must not receive a remote machine's todo command.
+    const current = candidate && this.chatMachine(candidate) === (machineOf(x.slug ?? "") ?? mOf(x.folder))
+      ? candidate : null;
+    const project = this.chatsIn(x.folder).filter((a) => a.address !== current?.address);
+    return { current, project };
   }
 
   // What the sidebar calls an agent: a name given to its tab, else its
@@ -1257,14 +1300,15 @@ export default class Todos extends View {
       // In the card window a press is a drag unless stopped: rows stay clicks.
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => { fn(cx); cx.notify(); }).children(kids);
-    // Under a to-do whose agent button was clicked: Current conversation, each
-    // agent already running in that project by the name the sidebar gives it
+    // Under a to-do whose agent button was clicked: the focused conversation,
+    // then agents in the project's folder by the name the sidebar gives them
     // (its icon and status dot), then New conversation, of the kind its pill
     // shows (click the pill to pick; kept for next time).
     // The agent choice a running agent matches (its program's pick), for its icon.
     const agentPick = (a) => this.agentChoices.find((c) => c.key === a.program?.key || c.key === a.app);
     const starter = (x, go) => {
-      const running = this.chatsIn(x.folder).slice(0, 4), make = go ?? ((a) => this.startAgent(a, x, this.taskKind));
+      const { current, project } = this.conversationChoices(x);
+      const running = project.slice(0, 4), make = go ?? ((a) => this.startAgent(a, x, this.taskKind));
       const pick = this.agentChoices.find((a) => a.key === this.newPick) ?? this.agentChoices[0];
       const label = (text) => div().px(7).pt(4).pb(1).text_size(10.5).text_color(t.dim).child(text);
       return v_flex().relative().ml(30).mr(6).mb(6).p(3).gap(1).rounded(8).border_1().border_color(t.border).bg(t.popover)
@@ -1273,7 +1317,13 @@ export default class Todos extends View {
           .hover((s) => s.bg(t.hover)).tooltip("Close")
           .on_click((_e, cx) => { this.startFor = null; this.pickOpen = false; cx.notify(); })
           .child(svg("mods/workspace-chrome/x.svg").size(10).text_color(t.muted)))
-        .when(running.length > 0, (el) => el.child(label(running.length > 1 ? "Current conversations" : "Current conversation"))
+        .when(Boolean(current), (el) => el.child(label("Current conversation"))
+          .child(option("send-current", (cx) => (go ? go(null, cx, current) : this.sendTo(current, x, this.taskKind)), [
+            icon(agentPick(current), 13),
+            div().flex_1().min_w(0).truncate().child("This chat"),
+            div().size(6).flex_none().rounded(3).bg(t[current.status] ?? t.idle),
+          ])))
+        .when(running.length > 0, (el) => el.child(label("In this project"))
           .children(running.map((r) => option(`send-${r.address}`, (cx) => (go ? go(null, cx, r) : this.sendTo(r, x, this.taskKind)), [
             icon(agentPick(r), 13),
             div().flex_1().min_w(0).truncate().child(this.agentName(r)),
@@ -1299,7 +1349,8 @@ export default class Todos extends View {
     // running in its project are listed too — pick one, then a mode, and the
     // prompt goes straight into that conversation (focused).
     const ctxMenu = (x) => {
-      const key = `${x.slug}:${x.i}`, running = this.chatsIn(x.folder).slice(0, 4);
+      const key = `${x.slug}:${x.i}`, { current, project } = this.conversationChoices(x);
+      const running = project.slice(0, 4);
       const card = (kids) => v_flex().relative().ml(30).mr(6).mb(6).p(3).gap(1).rounded(8).border_1().border_color(t.border).bg(t.popover)
         .child(div().id("ctx-close").absolute().top(4).right(4).size(18).flex().items_center().justify_center().rounded(4).cursor_pointer()
           .hover((s) => s.bg(t.hover)).tooltip("Close")
@@ -1326,8 +1377,16 @@ export default class Todos extends View {
         modeRow("plan", "Plan & discuss", "plan", () => { this.menuFor = null; this.taskKind = "plan"; this.pickOpen = false; this.startFor = key; }),
         modeRow("wbs", "Break into sub-todos", "wbs", () => { this.menuFor = null; this.taskKind = "wbs"; this.pickOpen = false; this.startFor = key; }),
         modeRow("run", "Execute", "run", () => { this.menuFor = null; this.taskKind = "run"; this.pickOpen = false; this.startFor = key; }),
+        ...(current ? [
+          div().px(7).pt(3).pb(1).text_size(10.5).text_color(t.dim).child("Current conversation"),
+          option(`ctx-agent-${current.address}`, () => { this.menuAgent = current; }, [
+            icon(agentPick(current), 12),
+            div().flex_1().min_w(0).truncate().child("This chat"),
+            div().size(6).flex_none().rounded(3).bg(t[current.status] ?? t.idle),
+          ]),
+        ] : []),
         ...(running.length ? [
-          div().px(7).pt(3).pb(1).text_size(10.5).text_color(t.dim).child("Existing conversations"),
+          div().px(7).pt(3).pb(1).text_size(10.5).text_color(t.dim).child("In this project"),
           ...running.map((a) => option(`ctx-agent-${a.address}`, () => { this.menuAgent = a; }, [
             icon(agentPick(a), 12),
             div().flex_1().min_w(0).truncate().child(this.agentName(a)),
@@ -1339,23 +1398,24 @@ export default class Todos extends View {
     // A click on a to-do opens its card: this mod again as a window
     // (props().card = "slug:i"), drawn by cardView below.
     const openCard = (x) => {
+      const currentAgent = this.currentChat()?.address ?? null;
       const id = openOverlay({ mod: "over9k-todos", kind: "window", key: "todo-card", frame: "none", width: 400, height: 380,
-        props: { card: `${x.slug}:${x.i}`, color: this.color(x.folder, t) } });
+        props: { card: `${x.slug}:${x.i}`, color: this.color(x.folder, t), currentAgent } });
       this.cardIds.add(id);
     };
     // The card: the item's text and facts, its plan (the note) in a scrollbar,
-    // and the actions on the side — each leading to an agent, an existing
-    // conversation in its project first, then a new one.
+    // and the actions on the side — each leading to the current conversation,
+    // another conversation in its project, or a new one.
     const cardView = (key) => {
       const cut = String(key).lastIndexOf(":"), slug = String(key).slice(0, cut), n = Number(String(key).slice(cut + 1));
       const l = this.lists[slug], it = l ? l.items[n] : null;
       const x = it ? { ...it, slug, i: n, folder: l.folder } : null;
       const pc = props()?.color ?? t.accent; // the project's colour, from the panel
       const close = () => closeOverlay(props().overlay);
-      const running = x ? this.chatsIn(x.folder).slice(0, 6) : [];
-      const agentRow = (id, a) => option(`card-agent-${id}`, (cx) => { this.sendTo(a, x, this.cardKind); close(); }, [
+      const { current, project } = x ? this.conversationChoices(x, props()?.currentAgent) : { current: null, project: [] };
+      const agentRow = (id, a, label = this.agentName(a)) => option(`card-agent-${id}`, (cx) => { this.sendTo(a, x, this.cardKind); close(); }, [
         icon(agentPick(a), 12),
-        div().flex_1().min_w(0).truncate().child(this.agentName(a)),
+        div().flex_1().min_w(0).truncate().child(label),
         div().size(6).flex_none().rounded(3).bg(t[a.status] ?? t.idle),
       ]);
       const newRow = (a) => option(`card-new-${a.key}`, (cx) => { this.startAgent(a, x, this.cardKind); close(); }, [
@@ -1377,7 +1437,8 @@ export default class Todos extends View {
         sideKids.push(option("card-back", () => { this.cardKind = null; }, [
           div().flex_1().min_w(0).child(div().text_size(12).truncate().child("<- Actions")),
         ]));
-        if (running.length) sideKids.push(sect(running.length > 1 ? "Existing conversations" : "Existing conversation"), ...running.map(agentRow));
+        if (current) sideKids.push(sect("Current conversation"), agentRow("current", current, "This chat"));
+        if (project.length) sideKids.push(sect("In this project"), ...project.slice(0, 6).map((a, i) => agentRow(i, a)));
         sideKids.push(sect("New agent"));
         if (this.agentChoices.length) sideKids.push(...this.agentChoices.map(newRow));
         else sideKids.push(div().px(7).py(3).text_size(11).text_color(t.dim).child("Finding agents..."));
