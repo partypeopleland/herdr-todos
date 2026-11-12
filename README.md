@@ -4,13 +4,15 @@ A [Herdr](https://herdr.dev) mod that adds a **To-do** panel: per-project to-do 
 
 ## What it does
 
-- **Per-project lists** — each project (git repo / folder) gets a Markdown list at `~/.local/share/over9k/todos/<slug>.md` (`$XDG_DATA_HOME/over9k/todos` when set), a `<!-- folder: … -->` line then `- [ ]` / `- [x]` items with optional `<!-- due: … -->` and `<!-- done: … -->` metadata. Safe to edit by hand.
+- **Per-project lists** — each project (git repo / folder) gets a Markdown list at `~/.local/share/over9k/todos/<slug>.md` (`$XDG_DATA_HOME/over9k/todos` when set), a `<!-- folder: … -->` line then `- [ ]` / `- [~]` / `- [x]` items with optional `<!-- due: … -->`, `<!-- updated: … -->`, and `<!-- done: … -->` metadata. Safe to edit by hand.
 - **Project chips** — one chip per project with open to-dos (coloured like the sidebar), an "All" scope, and a chip for the project you're currently in that follows you as you move.
 - **Due dates** — type `@today`, `@fri`, `@nextweek`, `@in2h`, `@12nov`, `@4/11`, with an optional time (`@14:30`, `@fri 9am`); overdue items turn red.
 - **TODO.md suggestions** — "From TODO.md" items from the project's own to-do file; ticking one here (or via `todo done`) crosses its line out there through `todo-cross.py`.
 - **Remote machines** — spaces on other computers (`hc machine ls`) show their own lists, TODO.md and new-agent targets; remote state is read every 5 s.
 - **Log / Sync toggles** — per-project switches in the header control whether agents add what you ask for (`todo log`) and whether the project's `TODO.md` follows edits (`todo sync`); unset projects follow the global defaults.
-- **To-do / Done bands** — the list is folded into "To-do" and "Done today" sections.
+- **To-do / Doing / Done bands** — open and in-progress items remain visible; a small top-level Today / All switch filters completed items (Today by default). Done stays visible even when empty, and Clear removes only completed items in the current project and time range.
+- **Safe subtree removal** — deleting a parent opens a review card with independent checkboxes for every descendant. Unchecked descendants become top-level items.
+- **Doing timestamp** — entering Doing records when the status changed, which the item card shows as elapsed days.
 - **Send to agent** — hover an item (or a TODO.md suggestion) for an agent picker that starts the chosen agent on just that to-do; multi-select (Shift / Ctrl / Cmd + click) supports mark-done, send, and delete.
 
 ## Install

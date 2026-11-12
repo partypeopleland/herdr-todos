@@ -141,7 +141,8 @@ edit() {
   [ -f "$file" ] || { echo "No to-dos for $folder" >&2; exit 1; }
   line=$(grep -n -E '^ *- \[( |x|~)\] ' "$file" | sed -n "${1}p" | cut -d: -f1)
   [ -n "$line" ] || { echo "No item $1" >&2; exit 1; }
-  sed "${line}$2" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+  # Keep every expression scoped to this item (some callers pass several).
+  sed "${line}{${2};}" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
 }
 
 cmd=${1:-list}; [ $# -gt 0 ] && shift
@@ -201,8 +202,8 @@ case "$cmd" in
     case "$cmd" in done|check) way=done ;; *) way=undo ;; esac
     "$0" -p "$folder" "_$way" "$n"
     [ -n "$text" ] && { [ -n "$PY" ] && "$PY" -I "$HERE/todo-cross.py" "$folder" "$way" "$text" 2>/dev/null; } || true ;;
-  _done) edit "${1:?item number}" "s/^\\( *\\)- \\[[ ~]\\] \\(.*\\)\$/\\1- [x] \\2 <!-- done: $(date '+%F %H:%M') -->/" ;;
-  _undo) edit "${1:?item number}" 's/^\( *\)- \[x\] /\1- [ ] /; s/ *<!-- done: [^>]* -->//' ;;
+  _done) edit "${1:?item number}" "s/^\\( *\\)- \\[[ ~]\\] \\(.*\\)\$/\\1- [x] \\2 <!-- done: $(date '+%F %H:%M') -->/; s/ *<!-- updated: [^>]* -->//g" ;;
+  _undo) edit "${1:?item number}" 's/^\( *\)- \[x\] /\1- [ ] /; s/ *<!-- done: [^>]* -->//g; s/ *<!-- updated: [^>]* -->//g' ;;
   # Being worked on ([~]) or back to plain ([ ]): the panel's Doing section.
   doing|start)
     n=${1:?item number or text}
@@ -214,8 +215,15 @@ case "$cmd" in
     case "$n" in *[!0-9]*) m=$(grep -E '^ *- \[( |x|~)\] ' "$file" 2>/dev/null | sed 's/^ *- \[.\] //; s/ *<!--[^>]*-->//g' | grep -n -x -F -- "$n" | head -n 1 | cut -d: -f1)
       [ -n "$m" ] || { echo "No item \"$n\"" >&2; exit 1; }; n=$m ;; esac
     "$0" -p "$folder" "_open" "$n" ;;
-  _doing) edit "${1:?item number}" 's/^\( *\)- \[[ x]\] /\1- [~] /; s/ *<!-- done: [^>]* -->//' ;;
-  _open) edit "${1:?item number}" 's/^\( *\)- \[[ x~]\] /\1- [ ] /; s/ *<!-- done: [^>]* -->//' ;;
+  _doing)
+    n=${1:?item number}
+    box=$(grep -E '^ *- \[( |x|~)\] ' "$file" 2>/dev/null | sed -n "${n}p" | sed -n 's/^ *- \[\(.\)\] .*/\1/p')
+    case "$box" in
+      ' '|x) edit "$n" "s/^\\( *\\)- \\[[ x]\\] /\\1- [~] /; s/ *<!-- done: [^>]* -->//g; s/ *<!-- updated: [^>]* -->//g; s|$| <!-- updated: $(date '+%F %H:%M') -->|" ;;
+      '~') ;; # Repeated `todo doing` is not a new status transition.
+      *) echo "No item $n" >&2; exit 1 ;;
+    esac ;;
+  _open) edit "${1:?item number}" 's/^\( *\)- \[[ x~]\] /\1- [ ] /; s/ *<!-- done: [^>]* -->//g; s/ *<!-- updated: [^>]* -->//g' ;;
   edit|reword)
     n=${1:?item number or text}; shift
     new=$(printf '%s' "$*" | tr '\n' ' ' | sed 's/  *$//')

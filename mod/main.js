@@ -219,8 +219,9 @@ function readDayMonth(word) {
 function parseLine(text) {
   const due = /<!-- due: ([^>]*?) -->/.exec(text)?.[1] ?? null;
   const done = /<!-- done: ([^>]*?) -->/.exec(text)?.[1] ?? null;
+  const updated = /<!-- updated: ([^>]*?) -->/.exec(text)?.[1] ?? null;
   const note = /<!-- note: ([^>]*?) -->/.exec(text)?.[1] ?? null;
-  return { text: text.replace(/\s*<!--[^>]*-->/g, "").trim(), due, doneOn: done, note };
+  return { text: text.replace(/\s*<!--[^>]*-->/g, "").trim(), due, doneOn: done, updatedAt: updated, note };
 }
 // "<!-- skip: text -->" lines: TODO.md items hidden from the suggestions.
 function parse(raw) {
@@ -233,7 +234,7 @@ function parse(raw) {
   const opts = { log: log ? log === "on" : d.log, sync: sync ? sync === "on" : d.sync, set: { log: Boolean(log), sync: Boolean(sync) } };
   return { folder, items, skipped, opts };
 }
-const line = (i) => `${"  ".repeat(i.depth ?? 0)}- [${i.done ? "x" : i.doing ? "~" : " "}] ${i.text.replace(/\n/g, " ")}${i.due ? ` <!-- due: ${i.due} -->` : ""}${i.done && i.doneOn ? ` <!-- done: ${i.doneOn} -->` : ""}${i.note ? ` <!-- note: ${i.note.replace(/-->/g, "")} -->` : ""}`;
+const line = (i) => `${"  ".repeat(i.depth ?? 0)}- [${i.done ? "x" : i.doing ? "~" : " "}] ${i.text.replace(/\n/g, " ")}${i.due ? ` <!-- due: ${i.due} -->` : ""}${i.done && i.doneOn ? ` <!-- done: ${i.doneOn} -->` : ""}${i.updatedAt ? ` <!-- updated: ${i.updatedAt} -->` : ""}${i.note ? ` <!-- note: ${i.note.replace(/-->/g, "")} -->` : ""}`;
 const serialize = (folder, items, skipped = [], opts = {}) => `<!-- folder: ${folder} -->\n${opts.set?.log ? `<!-- log: ${opts.log ? "on" : "off"} -->\n` : ""}${opts.set?.sync ? `<!-- sync: ${opts.sync ? "on" : "off"} -->\n` : ""}${skipped.map((x) => `<!-- skip: ${x.replace(/-->/g, "")} -->\n`).join("")}${items.map(line).join("\n")}${items.length ? "\n" : ""}`;
 // File depths become tree depths: a removed parent leaves orphans, and a depth
 // can't skip a level — each item's depth is its count of ancestors.
@@ -513,6 +514,8 @@ export default class Todos extends View {
     try { this.folded = new Set(JSON.parse(localStorage.getItem("todos.fold") ?? "[]")); } catch { this.folded = new Set(); }
     this.proj = null; // a project chip's slug: All filtered to it (this session)
     this.filter = null;
+    this.doneAll = false; // Today is the default each time the panel opens.
+    this.deleteChecks = new Set(); // independent selections in a delete review window
     this.editing = null; // { slug, i }
     this.hover = null;
     this.input = InputState.new({ placeholder: "Add a to-do (#project @when)" });
@@ -774,10 +777,11 @@ export default class Todos extends View {
     const m = machineOf(slug);
     if (m) {
       const r = await exec("sh", ["-c", THERE_WRITE, "sh", slugOf(folder), text, old ?? "", old != null ? "1" : ""], onM(m)).catch(() => null);
-      if (r?.code !== 0) return this.loadRemote(cx); // changed there meanwhile: show theirs
+      if (r?.code !== 0) { await this.loadRemote(cx); return false; } // changed there meanwhile: show theirs
       this.lists[slug] = { folder, items, skipped, opts, raw: text, machine: m };
       if (opts.sync) SYNCED.add(folder); else SYNCED.delete(folder);
-      return cx.notify();
+      cx.notify();
+      return true;
     }
     try {
       await writeTextFile(path, text, old);
@@ -786,8 +790,10 @@ export default class Todos extends View {
       if (slug === "personal") this.pushPersonal(cx);
     } catch {
       await this.load(cx); // an agent changed it meanwhile: show theirs
+      return false;
     }
     cx.notify();
+    return true;
   }
 
   // "#name" picks the project (a listed one with to-dos, a space's, or a
@@ -927,7 +933,7 @@ export default class Todos extends View {
     const xs = this.picked(), on = xs.some((x) => !x.done);
     for (const slug of new Set(xs.map((x) => x.slug))) {
       const at = new Set(xs.filter((x) => x.slug === slug).map((x) => x.i));
-      this.change(slug, (items) => items.map((y, j) => (at.has(j) && y.done !== on ? { ...y, done: on, doing: on ? false : y.doing, doneOn: on ? stamp() : null } : y)), cx);
+      this.change(slug, (items) => items.map((y, j) => (at.has(j) && y.done !== on ? { ...y, done: on, doing: on ? false : y.doing, doneOn: on ? stamp() : null, updatedAt: null } : y)), cx);
     }
     for (const x of xs) if (x.done !== on) { cross(x.folder, on ? "done" : "undo", x.text); this.fileAt[x.folder] = 0; }
     this.unpick();
@@ -935,12 +941,64 @@ export default class Todos extends View {
 
   deletePicked(cx) {
     const xs = this.picked();
-    for (const slug of new Set(xs.map((x) => x.slug))) {
-      const at = new Set(xs.filter((x) => x.slug === slug).map((x) => x.i));
-      this.change(slug, (items) => items.filter((_, j) => !at.has(j)), cx);
-    }
-    for (const x of xs) toFile(x.folder, "rm", x.text);
     this.unpick();
+    this.requestDelete(xs, cx, "Delete");
+  }
+
+  // A deletion removes its requested roots. Any other descendant may be
+  // selected in the review card; every retained descendant becomes a root.
+  async deleteTree(slug, roots, checked, cx) {
+    const l = this.lists[slug];
+    if (!l) return false;
+    const removed = new Set([...roots, ...checked]);
+    const stack = [];
+    const next = [];
+    l.items.forEach((x, i) => {
+      const depth = x.depth ?? 0;
+      while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop();
+      const underRemoved = stack.some((a) => removed.has(a.i));
+      if (!removed.has(i)) next.push(underRemoved ? { ...x, depth: 0 } : x);
+      stack.push({ i, depth });
+    });
+    if (!await this.write(slug, l.folder, next, cx)) return false;
+    for (const i of removed) if (l.items[i]) toFile(l.folder, "rm", l.items[i].text);
+    return true;
+  }
+
+  requestDelete(xs, cx, label = "Delete") {
+    const requested = xs.filter((x) => this.lists[x.slug]?.items[x.i]?.text === x.text)
+      .map((x) => ({ slug: x.slug, i: x.i, text: x.text }));
+    if (!requested.length) return;
+    // When a selected parent contains another selected item, the child still
+    // starts unchecked in the review. Only outermost requested items are fixed.
+    const targets = [];
+    for (const slug of new Set(requested.map((x) => x.slug))) {
+      const l = this.lists[slug], wanted = new Map(requested.filter((x) => x.slug === slug).map((x) => [x.i, x]));
+      const stack = [];
+      l.items.forEach((x, i) => {
+        const depth = x.depth ?? 0;
+        while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop();
+        if (wanted.has(i) && !stack.some((a) => wanted.has(a.i))) targets.push(wanted.get(i));
+        stack.push({ i, depth });
+      });
+    }
+    const roots = new Map();
+    for (const x of targets) {
+      if (!roots.has(x.slug)) roots.set(x.slug, new Set());
+      roots.get(x.slug).add(x.i);
+    }
+    const hasDescendants = targets.some((x) => {
+      const items = this.lists[x.slug]?.items ?? [], depth = items[x.i]?.depth ?? 0;
+      return items[x.i + 1] && (items[x.i + 1].depth ?? 0) > depth;
+    });
+    if (!hasDescendants) {
+      cx.spawn(async (cx) => { for (const [slug, at] of roots) await this.deleteTree(slug, at, new Set(), cx); });
+      return;
+    }
+    const snapshots = Object.fromEntries([...roots.keys()].map((slug) => [slug, this.lists[slug].raw]));
+    const id = openOverlay({ mod: "over9k-todos", kind: "window", key: `todo-delete-review-${Date.now()}`, frame: "none", width: 450, height: 500,
+      props: { deleteReview: targets, deleteSnapshots: snapshots, deleteLabel: label } });
+    this.cardIds.add(id);
   }
 
   // Folder forms differ (\ vs /, trailing slash, Windows case): compare normalized.
@@ -1114,8 +1172,12 @@ export default class Todos extends View {
     this.editing = null;
     const { text, due } = takeDue(this.editInput.value().trim());
     const was = this.lists[e.slug]?.items[e.i], folder = this.lists[e.slug]?.folder;
-    if (was && folder && text !== was.text) toFile(folder, ...(text ? ["rename", was.text, text] : ["rm", was.text]));
-    this.change(e.slug, (items) => (text ? items.map((x, i) => (i === e.i ? { ...x, text, due: due ?? x.due } : x)) : items.filter((_, i) => i !== e.i)), cx);
+    if (!text) {
+      if (was && folder) this.requestDelete([{ ...was, slug: e.slug, i: e.i, folder }], cx);
+      return;
+    }
+    if (was && folder && text !== was.text) toFile(folder, "rename", was.text, text);
+    this.change(e.slug, (items) => items.map((x, i) => (i === e.i ? { ...x, text, due: due ?? x.due } : x)), cx);
   }
 
   render(cx) {
@@ -1143,7 +1205,8 @@ export default class Todos extends View {
     }
     const bucket = (x) => buckets[x.slug]?.[x.i];
     const all = Object.entries(this.lists).filter(([, l]) => inScope(l)).flatMap(([slug, l]) => l.items.map((x, i) => ({ ...x, slug, i, folder: l.folder })));
-    const open = all.filter((x) => bucket(x) === "todo"), doings = all.filter((x) => bucket(x) === "doing"), completed = all.filter((x) => bucket(x) === "done").sort((a, b) => (b.doneOn ?? "").localeCompare(a.doneOn ?? ""));
+    const open = all.filter((x) => bucket(x) === "todo"), doings = all.filter((x) => bucket(x) === "doing"), completed = all.filter((x) => bucket(x) === "done" && (this.doneAll || x.doneOn?.slice(0, 10) === today()))
+      .sort((a, b) => (b.doneOn ?? "").localeCompare(a.doneOn ?? ""));
     // A chip per project with items shown in the panel (the one you're in has
     // its own). Completed items keep their project visible until cleared.
     const bySlug = {};
@@ -1189,7 +1252,7 @@ export default class Todos extends View {
     const flatten = (nodes) => nodes.flatMap((n) => (this.folded.has(n.x._key) ? [n] : [n, ...flatten(n.kids)]));
     const todoFlat = flatten(forest((_x, slug, i) => buckets[slug][i] === "todo").sort(byDue));
     const doingFlat = flatten(forest((_x, slug, i) => buckets[slug][i] === "doing").sort(byDue));
-    const doneFlat = flatten(forest((_x, slug, i) => buckets[slug][i] === "done").sort(byDone));
+    const doneFlat = flatten(forest((x, slug, i) => buckets[slug][i] === "done" && (this.doneAll || x.doneOn?.slice(0, 10) === today())).sort(byDone));
     this.visible = [...doingFlat, ...todoFlat, ...doneFlat].map((n) => n.x);
     const nOpen = shown(open).length, nDoing = shown(doings).length;
     const picks = this.picked();
@@ -1241,7 +1304,7 @@ export default class Todos extends View {
           .when(x.doing && !x.done, (el) => el.bg(t.working).flex().items_center().justify_center().child(div().text_size(10).font_semibold().text_color(t.background).child("~")))
           .on_click((e, cx) => {
             if (multi(e) && this.filter) return; // the row picks it
-            this.change(x.slug, (items) => items.map((y, j) => (j === x.i ? { ...y, done: !y.done, doing: false, doneOn: y.done ? null : stamp() } : y)), cx);
+            this.change(x.slug, (items) => items.map((y, j) => (j === x.i ? { ...y, done: !y.done, doing: false, doneOn: y.done ? null : stamp(), updatedAt: null } : y)), cx);
             // Crossed out (or back in) in the project's own TODO.md too, if it lists it.
             cross(x.folder, x.done ? "undo" : "done", x.text);
             this.fileAt[x.folder] = 0;
@@ -1264,14 +1327,14 @@ export default class Todos extends View {
         .when(!this.filter && !editing && !(hovered && !x.done), (el) => el.child(div().flex_none().max_w(110).truncate().text_right().text_size(11).text_color(c).child(machineOf(x.slug) ? `${machineOf(x.slug)}/${this.name(x.folder)}` : this.name(x.folder))))
         .when(hovered && !editing && !x.done, (el) => el.child(div().id(`doing-${key}`).size(20).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
           .hover((s) => s.bg(t.raised)).tooltip(x.doing ? "Back to to-do" : "Doing")
-          .on_click((_e, cx) => { this.change(x.slug, (items) => items.map((y, j) => (j === x.i ? { ...y, doing: !y.doing } : y)), cx); })
+          .on_click((_e, cx) => { this.change(x.slug, (items) => items.map((y, j) => (j === x.i ? { ...y, doing: !y.doing, updatedAt: y.doing ? null : stamp() } : y)), cx); })
           .child(svg("mods/workspace-chrome/clock.svg").size(11).text_color(x.doing ? t.working : t.muted))))
         .when((hovered || this.startFor === key) && !editing && !x.done && this.agentChoices.length > 0, (el) => el.child(div().id(`start-${key}`).size(20).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
           .when(this.startFor === key, (el) => el.bg(t.selected))
           .hover((s) => s.bg(t.raised)).on_click((_e, cx) => { this.pickOpen = false; this.menuFor = null; this.taskKind = "run"; this.startFor = this.startFor === key ? null : key; cx.notify(); })
           .child(svg("mods/over9k-todos/bot.svg").size(12).text_color(t.muted))))
         .when(hovered && !editing, (el) => el.child(div().id(`del-${key}`).size(20).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
-          .hover((s) => s.bg(t.raised)).on_click((_e, cx) => { this.change(x.slug, (items) => items.filter((_, j) => j !== x.i), cx); toFile(x.folder, "rm", x.text); })
+          .hover((s) => s.bg(t.raised)).on_click((_e, cx) => this.requestDelete([x], cx))
           .child(svg("mods/workspace-chrome/x.svg").size(11).text_color(t.muted))));
     };
     // A section, as the sidebar's Parked: a chevron that folds it, its name and
@@ -1403,6 +1466,77 @@ export default class Todos extends View {
         props: { card: `${x.slug}:${x.i}`, color: this.color(x.folder, t), currentAgent } });
       this.cardIds.add(id);
     };
+    const deleteReviewView = (targets) => {
+      const close = () => closeOverlay(props().overlay);
+      const grouped = new Map();
+      for (const x of targets) {
+        if (!grouped.has(x.slug)) grouped.set(x.slug, new Set());
+        grouped.get(x.slug).add(x.i);
+      }
+      const stale = targets.some((x) => this.lists[x.slug]?.items[x.i]?.text !== x.text) ||
+        Object.entries(props()?.deleteSnapshots ?? {}).some(([slug, raw]) => this.lists[slug]?.raw !== raw);
+      const entries = [];
+      for (const [slug, roots] of grouped) {
+        const l = this.lists[slug];
+        if (!l) continue;
+        const stack = [];
+        l.items.forEach((x, i) => {
+          const depth = x.depth ?? 0;
+          while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop();
+          const parent = stack[stack.length - 1];
+          const rootDepth = roots.has(i) && parent?.rootDepth == null ? depth : parent?.rootDepth;
+          if (rootDepth != null) entries.push({ ...x, slug, i, folder: l.folder, level: depth - rootDepth, fixed: roots.has(i), key: `${slug}:${i}` });
+          stack.push({ depth, rootDepth });
+        });
+      }
+      const selected = entries.filter((x) => !x.fixed && this.deleteChecks.has(x.key)).length;
+      const rootCount = targets.length;
+      const reviewRow = (x) => h_flex().id(`delete-choice-${x.key}`).min_h(32).pl(8 + x.level * 16).pr(8).gap(8).items_center().rounded(5)
+        .when(!x.fixed, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => { this.deleteChecks.has(x.key) ? this.deleteChecks.delete(x.key) : this.deleteChecks.add(x.key); cx.notify(); }))
+        .child(div().size(14).flex_none().rounded(4).border_1().border_color(x.fixed ? t.ansi1 : t.muted)
+          .when(x.fixed || this.deleteChecks.has(x.key), (el) => el.bg(x.fixed ? t.ansi1 : t.accent).flex().items_center().justify_center()
+            .child(svg("mods/workspace-chrome/check.svg").size(10).text_color(t.background))))
+        .child(div().flex_1().min_w(0).text_size(12).whitespace_normal().child(x.text))
+        .when(x.fixed, (el) => el.child(div().flex_none().text_size(10).text_color(t.ansi1).child("Delete")))
+        .when(!x.fixed, (el) => el.child(div().flex_none().text_size(10).text_color(t.dim).child(this.deleteChecks.has(x.key) ? "Delete" : "Keep")));
+      return v_flex().size_full().rounded(10).border_1().border_color(t.border).bg(t.popover).shadow_lg().overflow_hidden().text_color(t.foreground)
+        .child(v_flex().size_full().p(12).gap(10)
+          .child(h_flex().items_center().gap(8)
+            .child(div().flex_1().font_semibold().text_size(14).child(`${props()?.deleteLabel ?? "Delete"} ${rootCount} item${rootCount === 1 ? "" : "s"}?`))
+            .child(div().size(20).flex().items_center().justify_center().rounded(4).cursor_pointer().hover((s) => s.bg(t.hover))
+              .on_click((_e, cx) => { cx.stop_propagation(); close(); })
+              .child(svg("mods/workspace-chrome/x.svg").size(11).text_color(t.dim))))
+          .child(div().text_size(11).line_height("16px").text_color(t.dim).whitespace_normal()
+            .child("Choose which children to delete. Unchecked children, including grandchildren, become top-level items."))
+          .child(v_flex().flex_1().min_h(0).p(4).rounded(7).bg(t.surface).overflow_y_scrollbar().mode("always")
+            .children(entries.map(reviewRow)))
+          .when(stale, (el) => el.child(div().text_size(11).text_color(t.ansi1).child(this.booted ? "The list changed. Close and try again." : "Loading the list...")))
+          .child(h_flex().justify_end().gap(8)
+            .child(div().h(28).px(10).rounded(5).cursor_pointer().flex().items_center().hover((s) => s.bg(t.hover))
+              .on_click(() => close()).child("Cancel"))
+            .child(div().h(28).px(10).rounded(5).flex().items_center().bg(stale || this.deleting ? t.raised : t.ansi1).text_color(stale || this.deleting ? t.dim : t.background)
+              .when(!stale && !this.deleting, (el) => el.cursor_pointer().on_click((_e, cx) => {
+                if (Object.entries(props()?.deleteSnapshots ?? {}).some(([slug, raw]) => this.lists[slug]?.raw !== raw)) {
+                  cx.notify();
+                  return;
+                }
+                this.deleting = true;
+                cx.spawn(async (cx) => {
+                  for (const [slug, roots] of grouped) {
+                    const checked = new Set(entries.filter((x) => x.slug === slug && !x.fixed && this.deleteChecks.has(x.key)).map((x) => x.i));
+                    if (!await this.deleteTree(slug, roots, checked, cx)) {
+                      this.deleting = false;
+                      cx.notify();
+                      return;
+                    }
+                  }
+                  close();
+                });
+                cx.notify();
+              }))
+              .child(`Delete ${rootCount + selected}`))));
+    };
     // The card: the item's text and facts, its plan (the note) in a scrollbar,
     // and the actions on the side — each leading to the current conversation,
     // another conversation in its project, or a new one.
@@ -1426,7 +1560,10 @@ export default class Todos extends View {
         svg("mods/over9k-todos/bot.svg").size(12).flex_none().text_color(t.muted),
         div().flex_1().min_w(0).child(div().text_size(12).truncate().child(text)),
       ]);
+      const started = x?.doing && !x.done && x.updatedAt ? new Date(`${x.updatedAt.slice(0, 10)}T00:00:00`) : null;
+      const daysDoing = started && !Number.isNaN(started.getTime()) ? Math.max(0, Math.round((startOf(new Date()) - started) / 86400000)) : null;
       const where = !x ? "" : [machineOf(slug) ? machineOf(slug) + "/" + this.name(l.folder) : this.name(l.folder), x.done ? "Done" : x.doing ? "Doing" : "To-do", x.due ? "due " + dueWords(x.due) : ""].filter(Boolean).join(" · ");
+      const doingSince = daysDoing == null ? null : `Doing since ${x.updatedAt} (${daysDoing === 0 ? "today" : `${daysDoing} day${daysDoing === 1 ? "" : "s"} ago`})`;
       const sect = (text) => h_flex().gap(5).items_center().child(div().size(6).rounded(3).bg(pc)).child(div().text_size(10.5).font_semibold().text_color(t.dim).child(text));
       // The side column: the three actions, or — once one is picked — the
       // agents to send it to (existing conversations first, then new ones).
@@ -1459,7 +1596,8 @@ export default class Todos extends View {
             .child(div().size(9).flex_none().mt(5).rounded(5).bg(pc))
             .child(v_flex().flex_1().min_w(0).gap(2)
               .when(x, (el) => el.child(div().text_size(14).font_semibold().whitespace_normal().child(x.text))
-                .when(Boolean(where), (el2) => el2.child(div().text_size(11).text_color(t.dim).child(where))))
+                .when(Boolean(where), (el2) => el2.child(div().text_size(11).whitespace_normal().text_color(t.dim).child(where)))
+                .when(Boolean(doingSince), (el2) => el2.child(div().text_size(11).whitespace_normal().text_color(t.dim).child(doingSince))))
               .when(!x && this.booted, (el) => el.child(div().text_size(14).font_semibold().child("This to-do is gone.")))
               .when(!x && !this.booted, (el) => el.child(bar(16, 200))))
             .child(div().size(20).flex_none().flex().items_center().justify_center().rounded(4).cursor_pointer()
@@ -1521,6 +1659,8 @@ export default class Todos extends View {
       .on_click((_e, cx) => { fn(cx); cx.notify(); })
       .child(svg(icon).size(10).flex_none()).child(label);
     // An overlay copy of this mod (a left-clicked to-do's card) draws only that.
+    const review = props()?.deleteReview;
+    if (review) return deleteReviewView(review);
     const cardKey = (props()||{}).card;
     if (cardKey != null) return cardView(String(cardKey));
     return v_flex().size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
@@ -1530,6 +1670,13 @@ export default class Todos extends View {
         .child(div().font_semibold().child("To-do"))
         .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${open.length} open`))
         .child(div().flex_1())
+        .child(div().id("done-range").h(22).px(7).rounded(5).border_1().border_color(this.doneAll ? t.accent : t.border)
+          .text_size(10.5).flex().items_center().cursor_pointer().text_color(this.doneAll ? t.accent : t.dim)
+          .when(this.doneAll, (el) => el.bg(t.accent + "26"))
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .tooltip(`Done items: ${this.doneAll ? "all history" : "today"}. To-do and Doing always show all dates.`)
+          .on_click((_e, cx) => { this.doneAll = !this.doneAll; this.clearArmed = false; this.unpick(); cx.notify(); })
+          .child(`Done: ${this.doneAll ? "All" : "Today"}`))
         // Log and Sync for the project you're in (whichever tab shows).
         .when(hereOk, (el) => {
           const l = this.lists[hereSlug] ?? { folder: this.here, opts: defOpts() }, o = l.opts, n = this.name(this.here);
@@ -1593,7 +1740,7 @@ export default class Todos extends View {
               .hover((x) => x.bg(t.raised)).tooltip(`Delete from ${fromFile.file ?? "TODO.md"}`).on_click((_e, cx) => this.dropFromFile(focusFolder, text, cx))
               .child(svg("mods/workspace-chrome/x.svg").size(11).text_color(t.muted)))),
             ...(this.startFor === `file:${i}` ? [starter({ text, folder: focusFolder }, (a, cx, running) => this.startFromFile(a, focusFolder, text, cx, running))] : [])])))
-        // Done stays visible, including completed items from earlier days.
+        // Done stays visible even when the current time range has no items.
         .child(section("done", "Done", done.length, !this.doneFolded, () => { this.doneFolded = !this.doneFolded; },
             done.length > 0 ?
             div().id("done-clear").px(5).rounded(4).cursor_pointer().text_color(this.clearArmed ? t.ansi1 : t.dim).hover((s) => s.bg(t.raised).text_color(t.foreground))
@@ -1602,10 +1749,7 @@ export default class Todos extends View {
                 if (!this.clearArmed) { this.clearArmed = true; cx.spawn(async (cx) => { await cx.sleep(3000); this.clearArmed = false; cx.notify(); }); }
                 else {
                   this.clearArmed = false;
-                  for (const slug of new Set(done.map((x) => x.slug))) {
-                    const indices = new Set(done.filter((x) => x.slug === slug).map((x) => x.i));
-                    this.change(slug, (items) => items.filter((_, i) => !indices.has(i)), cx);
-                  }
+                  this.requestDelete(done, cx, "Clear");
                 }
                 cx.notify();
               })
