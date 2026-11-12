@@ -4,7 +4,11 @@
 // $XDG_DATA_HOME/over9k/todos when that's set): a
 // "<!-- folder: … -->" line, then "- [ ] text" / "- [x] text" lines, with
 // "<!-- due: 2026-11-04 15:00 -->" (or a date alone) and "<!-- done: 2026-11-03 -->"
-// after the text. The `todo` command (todo.sh) reads and writes the same files,
+// after the text. A sub-item is the same line indented 2 spaces under its parent
+// (each level = 2 spaces; `todo add --under` writes them): the panel shows them
+// as a tree, a parent's chevron folding its children away. "<!-- note: … -->"
+// keeps an agreed plan or decision on the item (shown under its text, never a
+// to-do itself; `todo note` writes it). The `todo` command (todo.sh) reads and writes the same files,
 // so what an agent adds shows here at once (watchFolder), and back.
 // In a space on another computer, the project you're in is that computer's: its
 // list, TODO.md and new agents are there (read every 5s; HERE, loadThere).
@@ -16,6 +20,9 @@
 // "#name" for another; "@today" / "@fri" / "@nextweek" / "@in2h" / "@12nov" / "@4/11"
 // (day and month in the computer's order; every form is listed above readWhen), with a time
 // ("@14:30", "@fri 9am") or not. A circle ticks; double-click edits; × deletes.
+// Right press opens the to-do's menu: Plan & discuss, Break into sub-todos
+// (WBS — the agent proposes the children, adds them with `todo add --under`
+// once confirmed) or Execute — each then opens the agent picker in that mode.
 // Ticked ones from before today stay in the file (`todo clear` removes them).
 // A project's own TODO.md (read only for suggestions, "From TODO.md") gets
 // its line crossed out when that to-do is ticked here or by `todo done`
@@ -41,7 +48,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { agentTask } from "./agent-name.js";
-import { theme, exec, home, appHome, spaces, machines, focused, shared, readTextFile, writeTextFile, watchFolder, knownAgents, run, notify, panes, hc, agents, setShared } from "herdr";
+import { theme, exec, home, appHome, spaces, machines, focused, shared, readTextFile, writeTextFile, watchFolder, knownAgents, run, notify, panes, hc, agents, setShared, terminals, openOverlay, closeOverlay, props } from "herdr";
 
 // Python 3 runs as "python3", else "python" (as on Windows): found once.
 let PY = null;
@@ -122,7 +129,7 @@ const toFile = (folder, ...args) => (SYNCED.has(folder) ? cross(folder, ...args)
 // TODO.md follows what's added, edited or deleted here (off unless on).
 const SYNCED = new Set(); // folders with Sync on
 const slugOf = (folder) => folder.replace(/\/+$/, "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "");
-const ITEM = /^- \[( |x|~)\] (.*)$/;
+const ITEM = /^( *)- \[( |x|~)\] (.*)$/;
 // A click that picks rather than acts, as in the over9k sidebar.
 // Log and Sync for a project that never set them: Options › To-do.
 const defOpts = () => { const o = shared("sidebar.options") ?? {}; return { log: o.todoLog !== false, sync: o.todoSync === true }; };
@@ -191,20 +198,34 @@ function readDayMonth(word) {
 function parseLine(text) {
   const due = /<!-- due: ([^>]*?) -->/.exec(text)?.[1] ?? null;
   const done = /<!-- done: ([^>]*?) -->/.exec(text)?.[1] ?? null;
-  return { text: text.replace(/\s*<!--[^>]*-->/g, "").trim(), due, doneOn: done };
+  const note = /<!-- note: ([^>]*?) -->/.exec(text)?.[1] ?? null;
+  return { text: text.replace(/\s*<!--[^>]*-->/g, "").trim(), due, doneOn: done, note };
 }
 // "<!-- skip: text -->" lines: TODO.md items hidden from the suggestions.
 function parse(raw) {
   const folder = /^<!-- folder: (.*) -->$/m.exec(raw ?? "")?.[1] ?? null;
-  const items = (raw ?? "").split("\n").map((l) => ITEM.exec(l)).filter(Boolean).map((m) => ({ done: m[1] === "x", doing: m[1] === "~", ...parseLine(m[2]) }));
+  // 2 leading spaces per level (as todo.sh's --under writes them).
+  const items = (raw ?? "").split("\n").map((l) => ITEM.exec(l)).filter(Boolean).map((m) => ({ done: m[2] === "x", doing: m[2] === "~", depth: Math.floor(m[1].length / 2), ...parseLine(m[3]) }));
   const skipped = [...(raw ?? "").matchAll(/^<!-- skip: (.*) -->$/gm)].map((m) => m[1]);
   // "<!-- log: on|off -->" / "<!-- sync: on|off -->" when set, else the default.
   const d = defOpts(), log = /^<!-- log: (on|off) -->$/m.exec(raw ?? "")?.[1], sync = /^<!-- sync: (on|off) -->$/m.exec(raw ?? "")?.[1];
   const opts = { log: log ? log === "on" : d.log, sync: sync ? sync === "on" : d.sync, set: { log: Boolean(log), sync: Boolean(sync) } };
   return { folder, items, skipped, opts };
 }
-const line = (i) => `- [${i.done ? "x" : i.doing ? "~" : " "}] ${i.text.replace(/\n/g, " ")}${i.due ? ` <!-- due: ${i.due} -->` : ""}${i.done && i.doneOn ? ` <!-- done: ${i.doneOn} -->` : ""}`;
+const line = (i) => `${"  ".repeat(i.depth ?? 0)}- [${i.done ? "x" : i.doing ? "~" : " "}] ${i.text.replace(/\n/g, " ")}${i.due ? ` <!-- due: ${i.due} -->` : ""}${i.done && i.doneOn ? ` <!-- done: ${i.doneOn} -->` : ""}${i.note ? ` <!-- note: ${i.note.replace(/-->/g, "")} -->` : ""}`;
 const serialize = (folder, items, skipped = [], opts = {}) => `<!-- folder: ${folder} -->\n${opts.set?.log ? `<!-- log: ${opts.log ? "on" : "off"} -->\n` : ""}${opts.set?.sync ? `<!-- sync: ${opts.sync ? "on" : "off"} -->\n` : ""}${skipped.map((x) => `<!-- skip: ${x.replace(/-->/g, "")} -->\n`).join("")}${items.map(line).join("\n")}${items.length ? "\n" : ""}`;
+// File depths become tree depths: a removed parent leaves orphans, and a depth
+// can't skip a level — each item's depth is its count of ancestors.
+const normDepth = (items) => {
+  const stack = [];
+  return items.map((x) => {
+    const fd = x.depth ?? 0;
+    while (stack.length && stack[stack.length - 1] >= fd) stack.pop();
+    const d = stack.length;
+    stack.push(fd);
+    return d === fd ? x : { ...x, depth: d };
+  });
+};
 
 // A project's own to-do file (TODO.md and the like), read, never written: its
 // open items ("- [ ] …", or every bullet when it has no checkboxes).
@@ -460,12 +481,15 @@ export default class Todos extends View {
   init(_props, cx) {
     cx.spawn(async (cx) => { await loadFormat(); cx.notify(); });
     this.lists = {}; // slug -> { folder, items, raw }
+    this.booted = false; // first load + remote read done (card shows "gone" after)
     this.here = null;
     this.hereFrom = null;
     // The tabs: "all" (your pinned projects, and the one you're in) or "here"
     // (only the project you're in, following you). this.filter is worked out
     // from it on each render: here's slug, or null for All.
     try { this.mode = localStorage.getItem("todos.mode") === "all" ? "all" : "here"; } catch { this.mode = "here"; }
+    // Folded parent to-dos ("slug:i"), as the tree's chevrons leave them.
+    try { this.folded = new Set(JSON.parse(localStorage.getItem("todos.fold") ?? "[]")); } catch { this.folded = new Set(); }
     this.proj = null; // a project chip's slug: All filtered to it (this session)
     this.filter = null;
     this.editing = null; // { slug, i }
@@ -486,6 +510,8 @@ export default class Todos extends View {
       await exec("mkdir", ["-p", PERSONAL()]).catch(() => null);
       await this.load(cx);
       await this.loadRemote(cx);
+      this.booted = true; // the card's "gone" vs "still loading" line
+      cx.notify();
       for (;;) {
         await watchFolder(DIR()).catch(() => cx.sleep(5000));
         await this.load(cx);
@@ -506,6 +532,11 @@ export default class Todos extends View {
     this.ruleOk = true; // agents have the to-do rule (CLAUDE.md); off: a hint offers to set it up
     this.checkRule(cx);
     this.startFor = null; // the to-do whose agent choices show
+    this.menuFor = null; // the to-do whose right-click menu shows
+    this.menuAgent = null; // the existing conversation picked in that menu
+    this.cardKind = null; // the card overlay's picked action: plan, wbs or run
+    this.cardIds = new Set(); // card overlays this panel opened (closed on edit)
+    this.taskKind = "run"; // what the agent is asked: run, plan or wbs
     this.agentChoices = [];
     cx.spawn(async (cx) => { this.agentChoices = (await knownAgents().catch(() => [])).filter((a) => a.installed); cx.notify(); });
     this.sel = new Map(); // "slug:i" -> its text (a pick whose text moved is dropped)
@@ -593,7 +624,41 @@ export default class Todos extends View {
     this.remoteMachines = ms;
     // First look after start: push this machine's personal file to them all.
     if (!this.pushedInit) { this.pushedInit = true; this.pushPersonal(cx); }
+    this.syncTodoTools(cx).catch(() => null);
     cx.notify();
+  }
+
+  // The `todo` command and its helpers on every computer: agents there run
+  // the same todo.sh (~/.local/share/over9k-todos — what ~/.local/bin/todo
+  // execs), so a machine whose copy differs gets this one's, whole. cksum
+  // fingerprints, checked at most once a minute alongside the lists' read.
+  async syncTodoTools(cx) {
+    const now = Date.now();
+    if (now - (this.toolsAt ?? 0) < 60000) return;
+    this.toolsAt = now;
+    const dir = `${appHome().replace(/\\/g, "/")}/mods/over9k-todos`;
+    const files = ["todo.sh", "todo-cross.py"];
+    const local = {};
+    for (const f of files) {
+      const sum = await exec("sh", ["-c", "cksum \"$1\" | cut -d' ' -f1", "sh", `${dir}/${f}`]).catch(() => null);
+      if (sum?.code === 0) local[f] = sum.stdout.trim();
+    }
+    const ms = this.remoteMachines ?? [];
+    if (!Object.keys(local).length || !ms.length) return;
+    await Promise.all(ms.map(async (m) => {
+      const res = await exec("sh", ["-c",
+        'for f in "$@"; do p="$HOME/.local/share/over9k-todos/$f"; if [ -f "$p" ]; then cksum "$p" | cut -d" " -f1; else echo missing; fi; done',
+        "sh", ...files], onM(m)).catch(() => null);
+      if (res?.code !== 0) return;
+      const remote = res.stdout.trim().split("\n");
+      await Promise.all(files.map(async (f, i) => {
+        const text = await readTextFile(`${dir}/${f}`).catch(() => null);
+        if (text == null || remote[i] === local[f]) return;
+        await exec("sh", ["-c",
+          'd="$HOME/.local/share/over9k-todos"; mkdir -p "$d" && printf %s "$1" > "$d/$2.tmp" && mv "$d/$2.tmp" "$d/$2" && chmod +x "$d/$2"',
+          "sh", text, f], onM(m)).catch(() => null);
+      }));
+    }));
   }
 
   // This machine's personal file, to every other computer's ~/.todo under the
@@ -677,6 +742,7 @@ export default class Todos extends View {
   }
 
   async write(slug, folder, items, cx, skipped = this.lists[slug]?.skipped ?? [], opts = this.lists[slug]?.opts ?? defOpts()) {
+    items = normDepth(items);
     const path = slug === "personal" ? PFILE() : `${DIR()}/${slug}.md`, old = this.lists[slug]?.raw ?? null;
     const text = serialize(folder, items, skipped, opts);
     const m = machineOf(slug);
@@ -769,11 +835,16 @@ export default class Todos extends View {
     else this.startAgent(a, { text, folder, due: null });
   }
 
-  // What an agent is told for to-do `x` (or several).
-  taskFor(x) {
+  // What an agent is told for to-do `x` (or several); kind: "run" (work it and
+  // tick it), "plan" (discuss the approach first, no work yet) or "wbs" (break
+  // it into sub-todos, after my confirmation).
+  taskFor(x, kind = "run") {
     const xs = [x].flat(), when = (y) => (y.due ? ` (due ${dueWords(y.due)})` : "");
     const tick = (y) => `\`todo done "${y.text.replace(/"/g, '\\"')}"\``;
-    if (xs.length === 1) return `Work on this one to-do from the project's list, and only this one: ${xs[0].text}${when(xs[0])}\n\nWhen it's finished, tick it: ${tick(xs[0])}.`;
+    const q = (y) => `"${y.text.replace(/"/g, '\\"')}"`;
+    if (xs.length === 1 && kind === "plan") return `I want to plan this to-do with you before any work starts: ${q(xs[0])}${when(xs[0])}\n\nTalk it through first — ask what you need to know and propose an approach. Don't start implementing until I say go. When we agree on the approach, save a one-line summary of it on the to-do itself so it survives this conversation and the next agent sees it — a headline, not the discussion: \`todo note ${q(xs[0])} "<summary>"\` (it's trimmed past ~140 characters).`;
+    if (xs.length === 1 && kind === "wbs") return `Break this to-do into sub-tasks (a work breakdown). It's ${q(xs[0])}${when(xs[0])} in the project's todo list.\n\nThe deliverable is the breakdown itself — child items under it in the todo list — not the work. Don't ask whether to start or how to execute; we'll dispatch the children later, one by one. If the item has a note (the agreed plan), treat it as the spec.\n\nPropose the breakdown first and wait for my confirmation. Once I confirm, add each sub-task as a child of it: \`todo add --under ${q(xs[0])} "<sub-task>"\` — keep each a short one-liner; nest deeper levels the same way.`;
+    if (xs.length === 1) return `Work on this one to-do from the project's list, and only this one: ${xs[0].text}${when(xs[0])}\n\nIts note, if it has one, is the agreed plan — follow it. When it's finished, tick it: ${tick(xs[0])}.`;
     return `Work on these to-dos from the project's list, and only these:\n\n${xs.map((y, i) => `${i + 1}. ${y.text}${when(y)}`).join("\n")}\n\nTick each one once it's finished: ${xs.map(tick).join(", ")}.`;
   }
 
@@ -803,6 +874,13 @@ export default class Todos extends View {
   }
   unpick() { this.sel.clear(); this.anchor = null; if (this.startFor === "sel") this.startFor = null; this.pickOpen = false; }
 
+  // A parent to-do's chevron: folds its sub-items away (kept across sessions).
+  fold(key, cx) {
+    if (this.folded.has(key)) this.folded.delete(key); else this.folded.add(key);
+    try { localStorage.setItem("todos.fold", JSON.stringify([...this.folded])); } catch {}
+    cx.notify();
+  }
+
   // Ticks the picked ones (or unticks them, when they're all ticked already).
   tickPicked(cx) {
     const xs = this.picked(), on = xs.some((x) => !x.done);
@@ -824,15 +902,43 @@ export default class Todos extends View {
     this.unpick();
   }
 
+  // Folder forms differ (\ vs /, trailing slash, Windows case): compare normalized.
+  inFolder(cwd, folder) {
+    const norm = (s) => (s ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const f = norm(folder), n = norm(cwd);
+    if (n === f || n.startsWith(f + "/")) return true;
+    if (!/^[a-zA-Z]:\//.test(f)) return false; // Windows paths ignore case
+    const l = f.toLowerCase();
+    return n.toLowerCase() === l || n.toLowerCase().startsWith(l + "/");
+  }
+
   // Agents already running in a project (their pane's folder in it), the one
   // you were last in first.
   runningIn(folder) {
     if (!folder) return [];
     const ps = panes();
-    return agents().filter((a) => {
-      const c = (ps.find((p) => p.terminal === a.address)?.cwd ?? "").replace(/\/+$/, "");
-      return c === folder || c.startsWith(folder + "/");
-    }).sort((a, b) => (b.address === this.lastAgent) - (a.address === this.lastAgent));
+    return agents().filter((a) => this.inFolder(ps.find((p) => p.terminal === a.address)?.cwd, folder))
+      .sort((a, b) => (b.address === this.lastAgent) - (a.address === this.lastAgent));
+  }
+
+  // Conversations in a project that can take a prompt: every pane there whose
+  // program is an agent — including ones not reporting a status (agents()
+  // only lists reporters) and ones hc sees through a shell wrapper (its
+  // foreground process is the agent). Shaped like AgentInfo for
+  // agentName/sendTo/icon.
+  chatsIn(folder) {
+    if (!folder) return [];
+    const base = (s) => (s ?? "").replace(/\\/g, "/").split("/").pop();
+    const terms = new Map(terminals().map((t) => [t.address, t]));
+    const agentCmds = new Set([...this.agentChoices.map((a) => base(a.run?.[0])), "claude", "codex", "pi", "gemini", "aider", "opencode", "devin", "cursor-agent"].filter(Boolean));
+    const shells = new Set(["sh", "bash", "zsh", "fish", "dash", "ksh", "pwsh", "powershell", "cmd", "nu"]);
+    return panes().filter((p) => {
+      if (!p.terminal || !this.inFolder(p.cwd, folder)) return false;
+      if (p.status || p.app || (p.program?.agent && !p.program?.shell)) return true;
+      const fg = base(terms.get(p.terminal)?.foreground?.name ?? terms.get(p.terminal)?.foreground?.argv?.[0]);
+      return fg && agentCmds.has(fg) && !shells.has(fg);
+    }).map((p) => ({ address: p.terminal, pane: p.pane, status: p.status ?? "idle", app: p.app, program: p.program, title: p.title, tab_name: "" }))
+      .sort((a, b) => (b.address === this.lastAgent) - (a.address === this.lastAgent));
   }
 
   // What the sidebar calls an agent: a name given to its tab, else its
@@ -845,19 +951,19 @@ export default class Todos extends View {
   }
 
   // To-do `x` to agent `a` that's already running: into its conversation, shown.
-  sendTo(a, x) {
+  sendTo(a, x, kind = "run") {
     this.startFor = null;
     const xs = [x].flat();
-    hc(["send", a.address, this.taskFor(xs)]).catch(() => null);
+    hc(["send", a.address, this.taskFor(xs, kind)]).catch(() => null);
     run("pane.focus", { terminal: a.address });
     notify({ title: `Sent to ${a.tab_name || a.program?.name || "the agent"}`, body: xs.map((y) => y.text).join("\n"), level: "info" });
   }
 
   // Starts agent `a` on to-do `x` in its project's space (made if needed).
   // Several to-dos (all of one project): one agent on them all.
-  startAgent(a, x) {
+  startAgent(a, x, kind = "run") {
     this.startFor = null;
-    const xs = [x].flat(), folder = xs[0].folder, task = this.taskFor(xs);
+    const xs = [x].flat(), folder = xs[0].folder, task = this.taskFor(xs, kind);
     const first = xs.length > 1 ? `${xs.length} to-dos` : xs[0].text;
     const name = first.length > 28 ? `${first.slice(0, 27)}\u2026` : first;
     const m = mOf(folder);
@@ -942,26 +1048,58 @@ export default class Todos extends View {
     const pinned = new Set((pinList ?? []).map((f) => f.replace(/\/+$/, "")));
     const hereOk = Boolean(this.here && this.here !== home());
     const inScope = (l) => l.machine || isPersonal(l.folder) || !Array.isArray(pinList) || pinned.has(l.folder) || (hereOk && l.folder === this.here);
-    if (this.proj && !this.lists[this.proj]) this.proj = null;
-    this.filter = this.proj ?? (this.mode === "here" && hereOk ? hereSlug : null);
     const all = Object.entries(this.lists).filter(([, l]) => inScope(l)).flatMap(([slug, l]) => l.items.map((x, i) => ({ ...x, slug, i, folder: l.folder })));
-    const open = all.filter((x) => !x.done && !x.doing), doings = all.filter((x) => x.doing && !x.done), doneToday = all.filter((x) => x.done).sort((a, b) => (b.doneOn ?? "").localeCompare(a.doneOn ?? ""));
-    // A chip per project with to-dos (the one you're in has its own): its
-    // open count, so an all-done project still gets one to look back at.
+    // Done is today only (as its name says): older ticked items stay in the
+    // file for `todo clear`, they just don't crowd the panel.
+    const open = all.filter((x) => !x.done && !x.doing), doings = all.filter((x) => x.doing && !x.done), doneToday = all.filter((x) => x.done && (x.doneOn ?? "").startsWith(today())).sort((a, b) => (b.doneOn ?? "").localeCompare(a.doneOn ?? ""));
+    // A chip per project with items shown in the panel (the one you're in has
+    // its own). Older done items remain in files but have no visible row.
     const bySlug = {};
-    for (const x of all) { const b = bySlug[x.slug] ??= { open: 0, n: 0 }; b.n++; if (!x.done) b.open++; }
+    for (const x of [...open, ...doings, ...doneToday]) { const b = bySlug[x.slug] ??= { open: 0, n: 0 }; b.n++; if (!x.done) b.open++; }
+    // A category exists only while its list has items. Drop a selected chip
+    // once its last item is removed; "here" falls back to All when empty.
+    if (this.proj && !bySlug[this.proj]) this.proj = null;
+    this.filter = this.proj ?? (this.mode === "here" && hereOk && bySlug[hereSlug] ? hereSlug : null);
     const projects = Object.keys(bySlug).filter((s) => s !== "personal" && !(hereOk && s === hereSlug))
       .map((s) => { const l = this.lists[s], m = machineOf(s); return { slug: s, folder: l.folder, label: `${m ? `${m}/` : ""}${this.name(l.folder)}`, n: bySlug[s].open, color: this.color(l.folder, t) }; })
       .sort((a, b) => a.label.localeCompare(b.label));
-    // Personal (~/.todo) is yours, not a project's: its chip always shows.
-    projects.unshift({ slug: "personal", folder: PERSONAL(), label: "Personal", n: bySlug.personal?.open ?? 0, color: t.accent });
+    // Personal (~/.todo) follows the same rule as project categories.
+    if (bySlug.personal) projects.unshift({ slug: "personal", folder: PERSONAL(), label: "Personal", n: bySlug.personal.open, color: t.accent });
     const hereOpen = hereOk ? (this.lists[hereSlug]?.items ?? []).filter((x) => !x.done).length : 0;
     const shown = (list) => list.filter((x) => !this.filter || x.slug === this.filter);
     const dueKey = (x) => (x.due ? x.due.padEnd(16, " ") : "~");
-    const list = shown(open).sort((a, b) => (b.slug === hereSlug) - (a.slug === hereSlug) || dueKey(a).localeCompare(dueKey(b)) || a.slug.localeCompare(b.slug) || a.i - b.i);
-    const doingList = shown(doings).sort((a, b) => (b.slug === hereSlug) - (a.slug === hereSlug) || dueKey(a).localeCompare(dueKey(b)) || a.slug.localeCompare(b.slug) || a.i - b.i);
     const done = shown(doneToday);
-    this.visible = [...doingList, ...list, ...done];
+    // The lists as trees (the file's 2-space indents): a section keeps a node
+    // when it matches and its children follow it; a node whose parent isn't in
+    // the section (done, while it stays open) is promoted to the nearest shown
+    // ancestor, or to the top.
+    const forest = (pred) => {
+      const roots = [];
+      for (const [slug, l] of Object.entries(this.lists)) {
+        if (!inScope(l) || (this.filter && slug !== this.filter)) continue;
+        const stack = [];
+        l.items.forEach((x, i) => {
+          const fd = x.depth ?? 0;
+          while (stack.length && stack[stack.length - 1].fd >= fd) stack.pop();
+          if (!pred(x)) return;
+          const parent = stack[stack.length - 1];
+          const node = { x: { ...x, slug, i, folder: l.folder, _d: parent ? parent.d + 1 : 0, _key: `${slug}:${i}` }, fd, d: parent ? parent.d + 1 : 0, kids: [] };
+          (parent ? parent.kids : roots).push(node);
+          stack.push(node);
+        });
+      }
+      const mark = (n) => { n.x._k = n.kids.length; n.kids.forEach(mark); };
+      roots.forEach(mark);
+      return roots;
+    };
+    const byDue = (a, b) => (b.x.slug === hereSlug) - (a.x.slug === hereSlug) || dueKey(a.x).localeCompare(dueKey(b.x)) || a.x.slug.localeCompare(b.x.slug) || a.x.i - b.x.i;
+    const byDone = (a, b) => (b.x.doneOn ?? "").localeCompare(a.x.doneOn ?? "") || a.x.i - b.x.i;
+    const flatten = (nodes) => nodes.flatMap((n) => (this.folded.has(n.x._key) ? [n] : [n, ...flatten(n.kids)]));
+    const todoFlat = flatten(forest((x) => !x.done && !x.doing).sort(byDue));
+    const doingFlat = flatten(forest((x) => x.doing && !x.done).sort(byDue));
+    const doneFlat = flatten(forest((x) => x.done).sort(byDone));
+    this.visible = [...doingFlat, ...todoFlat, ...doneFlat].map((n) => n.x);
+    const nOpen = shown(open).length, nDoing = shown(doings).length;
     const picks = this.picked();
     if (picks.length !== this.sel.size) { this.sel = new Map(picks.map((x) => [`${x.slug}:${x.i}`, x.text])); if (!picks.length) this.unpick(); }
     const now = new Date();
@@ -993,10 +1131,19 @@ export default class Todos extends View {
       const key = `${x.slug}:${x.i}`, editing = this.editing?.slug === x.slug && this.editing.i === x.i, c = this.color(x.folder, t);
       const on = this.sel.get(key) === x.text, hovered = this.hover === key;
       const meta = x.done ? (x.doneOn ? doneWords(x.doneOn) : "") : x.due ? dueWords(x.due) : "";
-      return h_flex().id(`todo-${key}`).min_h(30).px(8).gap(8).items_center().rounded(8)
+      return h_flex().id(`todo-${key}`).min_h(30).pl(8 + (x._d ?? 0) * 16).pr(8).gap(8).items_center().rounded(8)
         .when(on, (el) => el.bg(t.accent + "38")).hover((s) => s.bg(on ? t.accent + "38" : t.hover))
-        .on_click((e, cx) => { if (multi(e) && !editing && this.filter) this.pick(x, e, cx); })
+        .on_click((e, cx) => { if (this.menuFor) { this.menuFor = null; cx.notify(); } if (multi(e) && !editing && this.filter) this.pick(x, e, cx); })
+        // Right press: this to-do's menu (plan / break down / execute).
+        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); this.menuFor = key; this.menuAgent = null; this.startFor = null; this.taskKind = "run"; cx.notify(); })
         .on_hover((on, cx) => { this.hover = on ? key : this.hover === key ? null : this.hover; cx.notify(); })
+        // A parent's chevron folds its sub-items; leaves keep the gutter so
+        // every checkbox lines up.
+        .child(div().w(14).h(14).flex_none().flex().items_center().justify_center()
+          .when((x._k ?? 0) > 0, (el) => el.child(div().size(12).flex().items_center().justify_center().rounded(3).cursor_pointer()
+            .hover((s) => s.bg(t.hover))
+            .on_click((_e, cx) => { cx.stop_propagation(); this.fold(x._key, cx); })
+            .child(svg(`mods/workspace-chrome/chevron-${this.folded.has(x._key) ? "right" : "down"}.svg`).size(9).text_color(t.dim)))))
         .child(div().id(`tick-${key}`).size(14).flex_none().rounded(7).border(1.5).cursor_pointer().border_color(c)
           .when(x.done, (el) => el.bg(c).flex().items_center().justify_center().child(svg("mods/workspace-chrome/check.svg").size(9).text_color(t.background)))
           .when(x.doing && !x.done, (el) => el.bg(t.working).flex().items_center().justify_center().child(div().text_size(10).font_semibold().text_color(t.background).child("~")))
@@ -1009,10 +1156,16 @@ export default class Todos extends View {
           }))
         .child(editing
           ? Input.new(this.editInput).flex_1().h(24).px(6).rounded(5).border_1().border_color(t.accent).bg(t.background).text_size(13).text_color(t.foreground)
-          : div().id(`text-${key}`).flex_1().min_w(0).text_size(13).line_height("18px").text_color(x.done ? t.dim : t.foreground)
-            .when(!hovered, (el) => el.truncate()).when(hovered, (el) => el.whitespace_normal().py(5))
-            .on_click((e, cx) => { if (e.click_count === 2 && !multi(e)) { this.editing = { slug: x.slug, i: x.i }; this.editInput.set_value(x.text + (x.due ? ` @${fmtDate(new Date(`${x.due.split(" ")[0]}T00:00:00`))}${x.due.includes(" ") ? ` ${fmtTime(x.due.split(" ")[1])}` : ""}` : "")); this.editInput.focus(); cx.notify(); } })
-            .child(x.text))
+          : v_flex().id(`text-${key}`).flex_1().min_w(0)
+            // A click on the item opens its card (an overlay copy of this mod).
+            .on_click((e, cx) => { if (e.click_count === 1 && !multi(e) && !editing) openCard(x); })
+            .child(div().text_size(13).line_height("18px").text_color(x.done ? t.dim : t.foreground)
+              .when(!hovered, (el) => el.truncate()).when(hovered, (el) => el.whitespace_normal().py(5))
+              .on_click((e, cx) => { if (e.click_count === 2 && !multi(e)) { this.editing = { slug: x.slug, i: x.i }; this.editInput.set_value(x.text + (x.due ? ` @${fmtDate(new Date(`${x.due.split(" ")[0]}T00:00:00`))}${x.due.includes(" ") ? ` ${fmtTime(x.due.split(" ")[1])}` : ""}` : "")); this.editInput.focus(); for (const id of this.cardIds) closeOverlay(id); this.cardIds.clear(); cx.notify(); } })
+              .child(x.text))
+            // The item's note (an agreed plan, a decision) under its text —
+            // one line, the whole of it on hover.
+            .when(Boolean(x.note), (el) => el.child(div().text_size(11).line_height("14px").text_color(t.dim).truncate().tooltip(x.note).child(x.note))))
         .when(Boolean(meta) && !editing && !(hovered && !x.done), (el) => el.child(div().flex_none().text_size(11).text_color(!x.done && overdue(x.due) ? t.ansi1 : t.dim).child(meta)))
         // In All, its project's name, in its colour, last so every row's lines up
         // on the right (the tabs above filter by it).
@@ -1023,7 +1176,7 @@ export default class Todos extends View {
           .child(svg("mods/workspace-chrome/clock.svg").size(11).text_color(x.doing ? t.working : t.muted))))
         .when((hovered || this.startFor === key) && !editing && !x.done && this.agentChoices.length > 0, (el) => el.child(div().id(`start-${key}`).size(20).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
           .when(this.startFor === key, (el) => el.bg(t.selected))
-          .hover((s) => s.bg(t.raised)).on_click((_e, cx) => { this.pickOpen = false; this.startFor = this.startFor === key ? null : key; cx.notify(); })
+          .hover((s) => s.bg(t.raised)).on_click((_e, cx) => { this.pickOpen = false; this.menuFor = null; this.taskKind = "run"; this.startFor = this.startFor === key ? null : key; cx.notify(); })
           .child(svg("mods/over9k-todos/bot.svg").size(12).text_color(t.muted))))
         .when(hovered && !editing, (el) => el.child(div().id(`del-${key}`).size(20).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
           .hover((s) => s.bg(t.raised)).on_click((_e, cx) => { this.change(x.slug, (items) => items.filter((_, j) => j !== x.i), cx); toFile(x.folder, "rm", x.text); })
@@ -1052,16 +1205,19 @@ export default class Todos extends View {
       : svg("mods/over9k-todos/bot.svg").size(size).flex_none().text_color(t.muted));
     const option = (id, fn, kids) => h_flex().id(id).h(26).px(7).gap(7).items_center().rounded(5).cursor_pointer()
       .text_size(12).text_color(t.foreground).hover((s) => s.bg(t.hover))
+      // In the card window a press is a drag unless stopped: rows stay clicks.
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => { fn(cx); cx.notify(); }).children(kids);
     // Under a to-do whose agent button was clicked: Current conversation, each
     // agent already running in that project by the name the sidebar gives it
     // (its icon and status dot), then New conversation, of the kind its pill
     // shows (click the pill to pick; kept for next time).
+    // The agent choice a running agent matches (its program's pick), for its icon.
+    const agentPick = (a) => this.agentChoices.find((c) => c.key === a.program?.key || c.key === a.app);
     const starter = (x, go) => {
-      const running = this.runningIn(x.folder).slice(0, 4), make = go ?? ((a) => this.startAgent(a, x));
+      const running = this.chatsIn(x.folder).slice(0, 4), make = go ?? ((a) => this.startAgent(a, x, this.taskKind));
       const pick = this.agentChoices.find((a) => a.key === this.newPick) ?? this.agentChoices[0];
       const label = (text) => div().px(7).pt(4).pb(1).text_size(10.5).text_color(t.dim).child(text);
-      const kind = (a) => this.agentChoices.find((c) => c.key === a.program?.key || c.key === a.app);
       return v_flex().relative().ml(30).mr(6).mb(6).p(3).gap(1).rounded(8).border_1().border_color(t.border).bg(t.popover)
         // × closes it (as does the agent button again).
         .child(div().id("starter-close").absolute().top(4).right(4).size(18).flex().items_center().justify_center().rounded(4).cursor_pointer()
@@ -1069,8 +1225,8 @@ export default class Todos extends View {
           .on_click((_e, cx) => { this.startFor = null; this.pickOpen = false; cx.notify(); })
           .child(svg("mods/workspace-chrome/x.svg").size(10).text_color(t.muted)))
         .when(running.length > 0, (el) => el.child(label(running.length > 1 ? "Current conversations" : "Current conversation"))
-          .children(running.map((r) => option(`send-${r.address}`, (cx) => (go ? go(null, cx, r) : this.sendTo(r, x)), [
-            icon(kind(r), 13),
+          .children(running.map((r) => option(`send-${r.address}`, (cx) => (go ? go(null, cx, r) : this.sendTo(r, x, this.taskKind)), [
+            icon(agentPick(r), 13),
             div().flex_1().min_w(0).truncate().child(this.agentName(r)),
             div().size(6).flex_none().rounded(3).bg(t[r.status] ?? t.idle),
           ]))))
@@ -1088,6 +1244,126 @@ export default class Todos extends View {
             icon(a, 12), div().flex_1().text_size(11.5).child(a.name),
             ...(a.key === pick?.key ? [svg("mods/workspace-chrome/check.svg").size(10).flex_none().text_color(t.accent)] : []),
           ])))));
+    };
+    // A to-do's right-click menu: its text, then what to do with it. The three
+    // modes open the agent picker under the row (starter); agents already
+    // running in its project are listed too — pick one, then a mode, and the
+    // prompt goes straight into that conversation (focused).
+    const ctxMenu = (x) => {
+      const key = `${x.slug}:${x.i}`, running = this.chatsIn(x.folder).slice(0, 4);
+      const card = (kids) => v_flex().relative().ml(30).mr(6).mb(6).p(3).gap(1).rounded(8).border_1().border_color(t.border).bg(t.popover)
+        .child(div().id("ctx-close").absolute().top(4).right(4).size(18).flex().items_center().justify_center().rounded(4).cursor_pointer()
+          .hover((s) => s.bg(t.hover)).tooltip("Close")
+          .on_click((_e, cx) => { this.menuFor = null; this.menuAgent = null; cx.notify(); })
+          .child(svg("mods/workspace-chrome/x.svg").size(10).text_color(t.muted)))
+        .children(kids);
+      const modeRow = (id, label, kind, fn) => option(`ctx-${id}`, (cx) => { fn(cx); cx.notify(); }, [
+        svg("mods/over9k-todos/bot.svg").size(12).flex_none().text_color(t.muted),
+        div().flex_1().min_w(0).truncate().child(label),
+      ]);
+      // An existing conversation picked: the three modes send straight to it.
+      if (this.menuAgent) {
+        const a = this.menuAgent;
+        return card([
+          div().px(7).pt(3).pb(1).text_size(11).text_color(t.dim).truncate().child(this.agentName(a)),
+          modeRow("back", "← back", null, (cx) => { this.menuAgent = null; cx.notify(); }),
+          modeRow("plan", "Plan & discuss", "plan", () => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "plan"); }),
+          modeRow("wbs", "Break into sub-todos", "wbs", () => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "wbs"); }),
+          modeRow("run", "Execute", "run", () => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "run"); }),
+        ]);
+      }
+      return card([
+        div().px(7).pt(3).pb(1).text_size(11).text_color(t.dim).truncate().child(x.text),
+        modeRow("plan", "Plan & discuss", "plan", () => { this.menuFor = null; this.taskKind = "plan"; this.pickOpen = false; this.startFor = key; }),
+        modeRow("wbs", "Break into sub-todos", "wbs", () => { this.menuFor = null; this.taskKind = "wbs"; this.pickOpen = false; this.startFor = key; }),
+        modeRow("run", "Execute", "run", () => { this.menuFor = null; this.taskKind = "run"; this.pickOpen = false; this.startFor = key; }),
+        ...(running.length ? [
+          div().px(7).pt(3).pb(1).text_size(10.5).text_color(t.dim).child("Existing conversations"),
+          ...running.map((a) => option(`ctx-agent-${a.address}`, () => { this.menuAgent = a; }, [
+            icon(agentPick(a), 12),
+            div().flex_1().min_w(0).truncate().child(this.agentName(a)),
+            div().size(6).flex_none().rounded(3).bg(t[a.status] ?? t.idle),
+          ])),
+        ] : []),
+      ]);
+    };
+    // A click on a to-do opens its card: this mod again as a window
+    // (props().card = "slug:i"), drawn by cardView below.
+    const openCard = (x) => {
+      const id = openOverlay({ mod: "over9k-todos", kind: "window", key: "todo-card", frame: "none", width: 400, height: 380,
+        props: { card: `${x.slug}:${x.i}`, color: this.color(x.folder, t) } });
+      this.cardIds.add(id);
+    };
+    // The card: the item's text and facts, its plan (the note) in a scrollbar,
+    // and the actions on the side — each leading to an agent, an existing
+    // conversation in its project first, then a new one.
+    const cardView = (key) => {
+      const cut = String(key).lastIndexOf(":"), slug = String(key).slice(0, cut), n = Number(String(key).slice(cut + 1));
+      const l = this.lists[slug], it = l ? l.items[n] : null;
+      const x = it ? { ...it, slug, i: n, folder: l.folder } : null;
+      const pc = props()?.color ?? t.accent; // the project's colour, from the panel
+      const close = () => closeOverlay(props().overlay);
+      const running = x ? this.chatsIn(x.folder).slice(0, 6) : [];
+      const agentRow = (id, a) => option(`card-agent-${id}`, (cx) => { this.sendTo(a, x, this.cardKind); close(); }, [
+        icon(agentPick(a), 12),
+        div().flex_1().min_w(0).truncate().child(this.agentName(a)),
+        div().size(6).flex_none().rounded(3).bg(t[a.status] ?? t.idle),
+      ]);
+      const newRow = (a) => option(`card-new-${a.key}`, (cx) => { this.startAgent(a, x, this.cardKind); close(); }, [
+        icon(a, 12),
+        div().flex_1().min_w(0).truncate().child(a.name),
+      ]);
+      const act = (id, text) => option(`card-${id}`, () => { this.cardKind = id; }, [
+        svg("mods/over9k-todos/bot.svg").size(12).flex_none().text_color(t.muted),
+        div().flex_1().min_w(0).child(div().text_size(12).truncate().child(text)),
+      ]);
+      const where = !x ? "" : [machineOf(slug) ? machineOf(slug) + "/" + this.name(l.folder) : this.name(l.folder), x.done ? "Done" : x.doing ? "Doing" : "To-do", x.due ? "due " + dueWords(x.due) : ""].filter(Boolean).join(" · ");
+      const sect = (text) => h_flex().gap(5).items_center().child(div().size(6).rounded(3).bg(pc)).child(div().text_size(10.5).font_semibold().text_color(t.dim).child(text));
+      // The side column: the three actions, or — once one is picked — the
+      // agents to send it to (existing conversations first, then new ones).
+      const sideKids = [];
+      if (!this.cardKind) {
+        sideKids.push(sect("Actions"), ...[["plan", "Plan & discuss"], ["wbs", "Break into sub-todos"], ["run", "Execute"]].map(([k, s]) => act(k, s)));
+      } else {
+        sideKids.push(option("card-back", () => { this.cardKind = null; }, [
+          div().flex_1().min_w(0).child(div().text_size(12).truncate().child("<- Actions")),
+        ]));
+        if (running.length) sideKids.push(sect(running.length > 1 ? "Existing conversations" : "Existing conversation"), ...running.map(agentRow));
+        sideKids.push(sect("New agent"));
+        if (this.agentChoices.length) sideKids.push(...this.agentChoices.map(newRow));
+        else sideKids.push(div().px(7).py(3).text_size(11).text_color(t.dim).child("Finding agents..."));
+      }
+      const noteBox = v_flex().flex_1().min_h(0).p(9).rounded(8).bg(t.surface)
+        .child(v_flex().id("card-note").flex_1().min_h(0).overflow_y_scrollbar().mode("always")
+          .child(div().flex_none().text_size(12).line_height("17px").whitespace_normal().text_color(x?.note ? t.foreground : t.dim)
+            .child(x?.note ?? "No plan recorded yet.")));
+      // While the lists load: a skeleton of the card, not an error.
+      const bar = (h, w) => div().h(h).w(w).flex_none().rounded(4).bg(t.raised);
+      const skeleton = v_flex().flex_1().min_h(0).gap(12)
+        .child(v_flex().flex_1().min_w(0).gap(8)
+          .child(bar(11, 90)).child(bar(11, 140)).child(div().flex_1().min_h(0).rounded(8).bg(t.raised)))
+        .child(v_flex().w(132).flex_none().gap(8).children([26, 26, 26].map(() => div().h(26).flex_1().rounded(5).bg(t.raised))));
+      return v_flex().size_full().rounded(10).border_1().border_color(pc).bg(t.popover).shadow_lg().overflow_hidden()
+        .child(v_flex().size_full().p(12).gap(10).text_color(t.foreground)
+          .child(h_flex().gap(8).items_start()
+            .child(div().size(9).flex_none().mt(5).rounded(5).bg(pc))
+            .child(v_flex().flex_1().min_w(0).gap(2)
+              .when(x, (el) => el.child(div().text_size(14).font_semibold().whitespace_normal().child(x.text))
+                .when(Boolean(where), (el2) => el2.child(div().text_size(11).text_color(t.dim).child(where))))
+              .when(!x && this.booted, (el) => el.child(div().text_size(14).font_semibold().child("This to-do is gone.")))
+              .when(!x && !this.booted, (el) => el.child(bar(16, 200))))
+            .child(div().size(20).flex_none().flex().items_center().justify_center().rounded(4).cursor_pointer()
+              .hover((s) => s.bg(t.hover)).tooltip("Close")
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => { cx.stop_propagation(); close(); cx.notify(); })
+              .child(svg("mods/workspace-chrome/x.svg").size(11).text_color(t.muted))))
+          .when(!x && !this.booted, (el) => el.child(skeleton))
+          .when(!x && this.booted, (el) => el.child(div().flex_1().text_size(12).text_color(t.dim).child("It was deleted, or the list changed.")))
+          .when(Boolean(x), (el) => el.child(h_flex().flex_1().min_h(0).gap(12)
+            .child(v_flex().flex_1().h_full().min_w(0).min_h(0).gap(5)
+              .child(sect("Plan / consensus"))
+              .child(noteBox))
+            .child(v_flex().w(132).flex_none().gap(1).border_l_1().border_color(t.border).pl(10).overflow_y_scrollbar().children(sideKids)))));
     };
     // The picked ones, as a bar under the add box: how many, then plain labelled
     // actions (as the sidebar's buttons: no borders, shaded on hover): Mark done
@@ -1119,7 +1395,10 @@ export default class Todos extends View {
           starter({ ...open[0], folder: many ? null : open[0].folder }, (a, _cx, to) => this.sendPicked(a, to)).ml(0).mr(0).mb(0)))
         .when(this.startFor === "sel" && many, (el) => el.child(div().px(4).text_size(11).text_color(t.dim).child(`A new agent in each of the ${folders.size} projects`)));
     };
-    const withStarter = (x) => [row(x), ...(this.startFor === `${x.slug}:${x.i}` ? [starter(x)] : [])];
+    const withStarter = (x) => {
+      const key = `${x.slug}:${x.i}`;
+      return [row(x), ...(this.startFor === key ? [starter(x)] : []), ...(this.menuFor === key ? [ctxMenu(x)] : [])];
+    };
 
     // A project switch, as the usage rows' plan badges ("Ultra", "Free"): a small
     // tag with its icon (the one the tabs show when it's on) and name; shaded with
@@ -1131,7 +1410,12 @@ export default class Todos extends View {
       .tooltip(`${tip} (${on ? "on" : "off"}: click to turn ${on ? "off" : "on"})`)
       .on_click((_e, cx) => { fn(cx); cx.notify(); })
       .child(svg(icon).size(10).flex_none()).child(label);
+    // An overlay copy of this mod (a left-clicked to-do's card) draws only that.
+    const cardKey = (props()||{}).card;
+    if (cardKey != null) return cardView(String(cardKey));
     return v_flex().size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+      // A press outside the panel closes an open right-click menu.
+      .on_mouse_down_out((_e, cx) => { if (this.menuFor) { this.menuFor = null; cx.notify(); } })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().child("To-do"))
         .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${open.length} open`))
@@ -1145,7 +1429,7 @@ export default class Todos extends View {
       .child(h_flex().flex_wrap().min_h(30).gap(2).px(8).pt(5).items_center().text_size(11.5)
         // The project you're in first, then a chip per project with open
         // to-dos, then All.
-        .when(hereOk, (el) => el.child(chip("here", this.name(this.here), hereOpen || null, this.color(this.here, t), this.filter === hereSlug, () => this.setMode("here"))))
+        .when(hereOk && Boolean(bySlug[hereSlug]), (el) => el.child(chip("here", this.name(this.here), hereOpen || null, this.color(this.here, t), this.filter === hereSlug, () => this.setMode("here"))))
         .children(projects.map((p) => chip(`p-${p.slug}`, p.label, p.n, p.color, this.filter === p.slug, () => this.pickProject(p.slug), p.folder)))
         .child(chip("all", "All", open.length, null, !this.filter, () => this.setMode("all"))))
       .child(v_flex().px(8).pt(4).pb(4)
@@ -1175,13 +1459,13 @@ export default class Todos extends View {
         .child(div().flex_1().min_w(0).child("Let agents keep these lists"))
         .child(div().flex_none().text_size(11.5).text_color(t.accent).child("Set up"))))
       .child(v_flex().id("todo-scroll").flex_1().min_h(0).overflow_y_scrollbar().px(8).pb(8)
-        .child(section("todo", "To-do", list.length, !this.todoFolded, () => { this.todoFolded = !this.todoFolded; }, null, { color: t.accent }))
-        .when(!this.todoFolded, (el) => el.children(list.flatMap(withStarter)))
-        .when(!list.length, (el) => el.child(div().px(8).py(6).text_size(12).text_color(t.dim)
+        .child(section("todo", "To-do", nOpen, !this.todoFolded, () => { this.todoFolded = !this.todoFolded; }, null, { color: t.accent }))
+        .when(!this.todoFolded, (el) => el.children(todoFlat.flatMap((n) => withStarter(n.x))))
+        .when(!nOpen, (el) => el.child(div().px(8).py(6).text_size(12).text_color(t.dim)
           .child(this.filter ? "Nothing left here" : `Nothing to do. New ones go to Personal (or pick a project with #).`)))
         // Doing: being worked on ([~] in the file); a row's clock button toggles it.
-        .child(section("doing", "Doing", doingList.length, !this.doingFolded, () => { this.doingFolded = !this.doingFolded; }, null, { color: t.working }))
-        .when(!this.doingFolded, (el) => el.children(doingList.flatMap(withStarter)))
+        .child(section("doing", "Doing", nDoing, !this.doingFolded, () => { this.doingFolded = !this.doingFolded; }, null, { color: t.working }))
+        .when(!this.doingFolded, (el) => el.children(doingFlat.flatMap((n) => withStarter(n.x))))
         .when(fromFile.items.length > 0, (el) => el
           .child(section("file", `From ${fromFile.file}`, fromFile.items.length, !this.fileFolded, () => { this.fileFolded = !this.fileFolded; },
             div().id("take-all").px(5).rounded(4).cursor_pointer().hover((x) => x.bg(t.raised).text_color(t.foreground)).child("Add all")
@@ -1201,19 +1485,19 @@ export default class Todos extends View {
               .hover((x) => x.bg(t.raised)).tooltip(`Delete from ${fromFile.file ?? "TODO.md"}`).on_click((_e, cx) => this.dropFromFile(focusFolder, text, cx))
               .child(svg("mods/workspace-chrome/x.svg").size(11).text_color(t.muted)))),
             ...(this.startFor === `file:${i}` ? [starter({ text, folder: focusFolder }, (a, cx, running) => this.startFromFile(a, focusFolder, text, cx, running))] : [])])))
-        // Done: all of them (the list scrolls), and Clear (twice) to delete
-        // the ticked ones of the projects shown, as `todo clear`.
+        // Done: today's ticked ones (the list scrolls), and Clear (twice) to
+        // delete them — older ticked ones stay for `todo clear`.
         .when(done.length > 0, (el) => el
           .child(section("done", "Done", done.length, !this.doneFolded, () => { this.doneFolded = !this.doneFolded; },
             div().id("done-clear").px(5).rounded(4).cursor_pointer().text_color(this.clearArmed ? t.ansi1 : t.dim).hover((s) => s.bg(t.raised).text_color(t.foreground))
               .on_click((_e, cx) => {
                 cx.stop_propagation();
                 if (!this.clearArmed) { this.clearArmed = true; cx.spawn(async (cx) => { await cx.sleep(3000); this.clearArmed = false; cx.notify(); }); }
-                else { this.clearArmed = false; for (const slug of new Set(done.map((x) => x.slug))) this.change(slug, (items) => items.filter((y) => !y.done), cx); }
+                else { this.clearArmed = false; for (const slug of new Set(done.map((x) => x.slug))) this.change(slug, (items) => items.filter((y) => !y.done || !(y.doneOn ?? "").startsWith(today())), cx); }
                 cx.notify();
               })
               .child(this.clearArmed ? `Clear ${done.length}?` : "Clear"),
             { color: t.done }))
-          .children(this.doneFolded ? [] : done.map(row))));
+          .children(this.doneFolded ? [] : doneFlat.map((n) => row(n.x)))));
   }
 }
