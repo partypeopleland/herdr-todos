@@ -13,7 +13,8 @@ A [Herdr](https://herdr.dev) mod that adds a **To-do** panel: per-project to-do 
 - **To-do / Doing / Done bands** — open and in-progress items remain visible; a small top-level Today / All switch filters completed items (Today by default). Done stays visible even when empty, and Clear removes only completed items in the current project and time range.
 - **Safe subtree removal** — deleting a parent opens a review card with independent checkboxes for every descendant. Unchecked descendants become top-level items.
 - **Doing timestamp** — entering Doing records when the status changed, which the item card shows as elapsed days.
-- **Send to agent** — hover an item (or a TODO.md suggestion) for an agent picker that starts the chosen agent on just that to-do; multi-select (Shift / Ctrl / Cmd + click) supports mark-done, send, and delete.
+- **Send to agent** — hover an item (or a TODO.md suggestion) for an agent picker; assigning it in Execute, Plan & discuss, or Break into sub-todos marks it Doing immediately. Multi-select (Shift / Ctrl / Cmd + click) supports mark-done, send, and delete.
+- **Discussion lifecycle** — Plan & discuss keeps the parent Doing while you reach consensus, saves the agreed approach in its note, then returns it to To-do without adding a child. Break into sub-todos tracks the breakdown in a `工作拆解` child; after adding the work items, it checks only that child and returns the parent to To-do. New work items remain open.
 
 ## Install
 
@@ -58,3 +59,11 @@ The mod is not part of Herdr's shipped layouts. Add a block to your layout (or a
 | `mod/*.svg` | Icons (project bot, Log and Sync switches) |
 
 `gpui-kit.d.ts` is intentionally not shipped — the app writes its own copy into each mod folder.
+
+## Tests
+
+Run the assignment and lifecycle tests with Node.js and Bash (Git Bash on Windows):
+
+```sh
+node --test
+```

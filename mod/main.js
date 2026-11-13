@@ -48,6 +48,9 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { agentTask } from "./agent-name.js";
+import { WBS_LABEL, findWbsChild, ensureWbsChild, wbsPrompt } from "./wbs-flow.mjs";
+import { planPrompt } from "./plan-flow.mjs";
+import { bucketItems } from "./todo-buckets.mjs";
 import * as fs from "fs/promises";
 import { theme, exec, home, appHome, spaces, machines, focused, shared, readTextFile, writeTextFile, watchFolder, knownAgents, run, notify, panes, hc, agents, setShared, terminals, openOverlay, closeOverlay, props } from "herdr";
 
@@ -873,9 +876,15 @@ export default class Todos extends View {
 
   // A TODO.md suggestion straight to an agent: on the list first, then started.
   startFromFile(a, folder, text, cx, running = null) {
-    this.take(folder, [text], cx);
-    if (running) this.sendTo(running, { text, folder, due: null });
-    else this.startAgent(a, { text, folder, due: null });
+    const slug = keyOf(folder), l = this.lists[slug];
+    cx.spawn(async (cx) => {
+      const i = l?.items.length ?? 0;
+      const added = await this.write(slug, folder, [...(l?.items ?? []), { done: false, doing: false, text, due: null, doneOn: null }], cx);
+      if (!added) return;
+      const item = { text, folder, due: null, slug, i };
+      if (running) this.sendTo(running, item, "run", cx);
+      else this.startAgent(a, item, "run", cx);
+    });
   }
 
   // What an agent is told for to-do `x` (or several); kind: "run" (work it and
@@ -889,10 +898,10 @@ export default class Todos extends View {
     const todo = (y) => isPersonal(y.folder) ? "todo personal" : `todo -p ${q(y.folder)}`;
     const tick = (y) => `\`${todo(y)} done ${q(y.text)}\``;
     const target = (y) => isPersonal(y.folder) ? "Personal list" : "project's list";
-    if (xs.length === 1 && kind === "plan") return `I want to plan this to-do with you before any work starts: ${q(xs[0].text)}${when(xs[0])}\n\nTalk it through first — ask what you need to know and propose an approach. Don't start implementing until I say go. When we agree on the approach, save a one-line summary of it on the to-do itself so it survives this conversation and the next agent sees it — a headline, not the discussion: \`${todo(xs[0])} note ${q(xs[0].text)} "<summary>"\` (it's trimmed past ~140 characters).`;
-    if (xs.length === 1 && kind === "wbs") return `Break this to-do into sub-tasks (a work breakdown). It's ${q(xs[0].text)}${when(xs[0])} in the ${target(xs[0])}.\n\nThe deliverable is the breakdown itself — child items under it in the todo list — not the work. Don't ask whether to start or how to execute; we'll dispatch the children later, one by one. If the item has a note (the agreed plan), treat it as the spec.\n\nPropose the breakdown first and wait for my confirmation. Once I confirm, add each sub-task as a child of it: \`${todo(xs[0])} add --under ${q(xs[0].text)} "<sub-task>"\` — keep each a short one-liner; nest deeper levels the same way.`;
-    if (xs.length === 1) return `Work on this one to-do from the ${target(xs[0])}, and only this one: ${xs[0].text}${when(xs[0])}\n\nIts note, if it has one, is the agreed plan — follow it. When it's finished, tick it: ${tick(xs[0])}.`;
-    return `Work on these to-dos from their lists, and only these:\n\n${xs.map((y, i) => `${i + 1}. ${y.text}${when(y)}`).join("\n")}\n\nTick each one once it's finished: ${xs.map(tick).join(", ")}.`;
+    if (xs.length === 1 && kind === "plan") return planPrompt({ parentText: xs[0].text, due: when(xs[0]), todo: todo(xs[0]) });
+    if (xs.length === 1 && kind === "wbs") return wbsPrompt({ parentText: xs[0].text, due: when(xs[0]), target: target(xs[0]), todo: todo(xs[0]) });
+    if (xs.length === 1) return `Work on this one to-do from the ${target(xs[0])}, and only this one: ${xs[0].text}${when(xs[0])}\n\nIts note, if it has one, is the agreed plan — follow it. The to-do is marked Doing when assigned. When it's finished, tick it: ${tick(xs[0])}.`;
+    return `Work on these to-dos from their lists, and only these:\n\n${xs.map((y, i) => `${i + 1}. ${y.text}${when(y)}`).join("\n")}\n\nThe to-dos are marked Doing when assigned. Tick each one once it's finished: ${xs.map(tick).join(", ")}.`;
   }
 
   // The picked to-dos as they are now (by their text: an agent may have moved them).
@@ -1088,37 +1097,160 @@ export default class Todos extends View {
     return named || agentTask(a, p?.cwd) || a.tab_name || a.program?.name || "Agent";
   }
 
+  // The list may change while a dispatch is in flight. Only mark the same
+  // item, and retry after write() reloads a conflicting file.
+  async markAssigned(xs, cx, changedOut = [], kind = "run") {
+    let allMarked = true;
+    for (const slug of new Set(xs.map((x) => x.slug).filter(Boolean))) {
+      const targets = xs.filter((x) => x.slug === slug);
+      let settled = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const l = this.lists[slug];
+        if (!l) break;
+        const items = l.items.map((y) => ({ ...y }));
+        let changed = false;
+        const reopened = [];
+        const assigned = [];
+        for (const x of targets) {
+          const y = items[x.i];
+          if (y?.text !== x.text || (y.done && (!x.done || y.doneOn !== x.doneOn))) continue;
+          const updatedAt = stamp();
+          if (!y.doing || y.done) {
+            items[x.i] = { ...y, done: false, doing: true, doneOn: null, updatedAt };
+            assigned.push({ slug, i: x.i, text: x.text, before: y, updatedAt });
+            if (y.done) reopened.push(y.text);
+            changed = true;
+          }
+          if (kind === "wbs" && targets.length === 1) {
+            const child = ensureWbsChild(items, x.i, updatedAt);
+            if (child && !child.unchanged) {
+              assigned.push({ slug, i: child.index, text: WBS_LABEL, before: child.before, updatedAt: child.updatedAt, trackingChild: true });
+              if (child.before?.done) reopened.push(WBS_LABEL);
+              changed = true;
+            }
+          }
+        }
+        const settledNow = (list) => targets.every((x) => {
+          const y = list[x.i];
+          if (y?.text !== x.text) return false;
+          if (y.done && (!x.done || y.doneOn !== x.doneOn)) return kind !== "wbs" && kind !== "plan"; // agent already finished
+          if (!y.doing || y.done) return false;
+          if (kind !== "wbs") return true;
+          const child = list[findWbsChild(list, x.i)];
+          return Boolean(child?.doing && !child.done);
+        });
+        if (!changed) {
+          settled = settledNow(l.items);
+          break;
+        }
+        if (await this.write(slug, l.folder, items, cx)) {
+          changedOut.push(...assigned);
+          for (const text of reopened) await cross(l.folder, "undo", text);
+          if (reopened.length) this.fileAt[l.folder] = 0;
+          settled = settledNow(this.lists[slug]?.items ?? []);
+          break;
+        }
+      }
+      if (!settled) allMarked = false;
+    }
+    return allMarked && xs.every((x) => Boolean(x.slug));
+  }
+
+  // If starting a new agent throws, undo only the Doing changes from that
+  // dispatch. A later edit or completion must win over this rollback.
+  async restoreAssignment(changes, cx) {
+    for (const slug of new Set(changes.map((x) => x.slug))) {
+      const targets = changes.filter((x) => x.slug === slug);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const l = this.lists[slug];
+        if (!l) break;
+        const items = l.items.map((y) => ({ ...y }));
+        const restored = [];
+        for (const x of targets) {
+          const y = items[x.i];
+          if (y?.text !== x.text || y.done || !y.doing || y.updatedAt !== x.updatedAt) continue;
+          if (x.trackingChild && !x.before) {
+            const next = items[x.i + 1];
+            if (next && (next.depth ?? 0) > (y.depth ?? 0)) continue; // someone added work beneath it
+            items.splice(x.i, 1);
+            restored.push(x);
+            continue;
+          }
+          items[x.i] = { ...y, done: x.before.done, doing: x.before.doing, doneOn: x.before.doneOn, updatedAt: x.before.updatedAt };
+          restored.push(x);
+        }
+        if (!restored.length) break;
+        if (await this.write(slug, l.folder, items, cx)) {
+          for (const x of restored) if (x.before?.done) await cross(l.folder, "done", x.text);
+          if (restored.some((x) => x.before?.done)) this.fileAt[l.folder] = 0;
+          break;
+        }
+      }
+    }
+  }
+
   // To-do `x` to agent `a` that's already running: into its conversation, shown.
-  sendTo(a, x, kind = "run") {
+  sendTo(a, x, kind = "run", cx, after = null) {
     this.startFor = null;
     const xs = [x].flat();
-    hc(["send", a.address, this.taskFor(xs, kind)]).catch(() => null);
-    run("pane.focus", { terminal: a.address });
-    notify({ title: `Sent to ${a.tab_name || a.program?.name || "the agent"}`, body: xs.map((y) => y.text).join("\n"), level: "info" });
+    cx.spawn(async (cx) => {
+      const changes = [];
+      // Discussion instructions assume the parent is Doing before the agent sees them.
+      if ((kind === "wbs" || kind === "plan") && !await this.markAssigned(xs, cx, changes, kind)) {
+        notify({ title: "Could not prepare assignment", body: xs.map((y) => y.text).join("\n"), level: "error" });
+        return;
+      }
+      const r = await hc(["send", a.address, this.taskFor(xs, kind)]).catch(() => null);
+      if (r?.code !== 0) {
+        if (changes.length) await this.restoreAssignment(changes, cx);
+        notify({ title: "Could not send to agent", body: r?.stderr?.trim() || "The assignment was not delivered.", level: "error" });
+        return;
+      }
+      const marked = kind === "wbs" || kind === "plan" || await this.markAssigned(xs, cx, [], kind);
+      run("pane.focus", { terminal: a.address });
+      notify({ title: marked ? `Sent to ${a.tab_name || a.program?.name || "the agent"}` : "Sent, but Doing was not updated", body: xs.map((y) => y.text).join("\n"), level: marked ? "info" : "warning" });
+      after?.();
+    });
   }
 
   // Starts agent `a` on to-do `x` in its project's space (made if needed).
   // Several to-dos (all of one project): one agent on them all.
-  startAgent(a, x, kind = "run") {
+  startAgent(a, x, kind = "run", cx, after = null) {
     this.startFor = null;
     const xs = [x].flat(), folder = xs[0].folder, task = this.taskFor(xs, kind);
     const first = xs.length > 1 ? `${xs.length} to-dos` : xs[0].text;
     const name = first.length > 28 ? `${first.slice(0, 27)}\u2026` : first;
     const m = mOf(folder);
     const there = spaces().find((s) => (s.machine ?? null) === m && (s.folder ?? "").replace(/\/+$/, "") === folder);
-    if (there) run("tab.new", { space: there.id, name, folder, argv: a.run, task });
-    else run("space.new", { name: this.name(folder), folder, tab: name, argv: a.run, task, machine: m ?? "" });
-    if (there && !there.active) run("space.select", { id: there.id });
-    notify({ title: `${a.name} is on it`, body: xs.map((y) => y.text).join("\n"), level: "info" });
+    cx.spawn(async (cx) => {
+      const changes = [];
+      const marked = await this.markAssigned(xs, cx, changes, kind);
+      if ((kind === "wbs" || kind === "plan") && !marked) {
+        notify({ title: "Could not prepare assignment", body: xs.map((y) => y.text).join("\n"), level: "error" });
+        return;
+      }
+      try {
+        if (there) run("tab.new", { space: there.id, name, folder, argv: a.run, task });
+        else run("space.new", { name: this.name(folder), folder, tab: name, argv: a.run, task, machine: m ?? "" });
+      } catch (e) {
+        await this.restoreAssignment(changes, cx);
+        notify({ title: "Could not start agent", body: String(e), level: "error" });
+        return;
+      }
+      if (!marked) notify({ title: "Agent started, but Doing was not updated", body: xs.map((y) => y.text).join("\n"), level: "warning" });
+      after?.();
+      if (there && !there.active) run("space.select", { id: there.id });
+      notify({ title: `${a.name} is on it`, body: xs.map((y) => y.text).join("\n"), level: "info" });
+    });
   }
 
   // The picked open to-dos to agents: one already running (when they're all
   // one project's), or a new one per project.
-  sendPicked(a, target) {
+  sendPicked(a, target, cx) {
     const xs = this.picked().filter((x) => !x.done);
     if (!xs.length) return;
-    if (target) this.sendTo(target, xs);
-    else for (const f of new Set(xs.map((x) => x.folder))) this.startAgent(a, xs.filter((x) => x.folder === f));
+    if (target) this.sendTo(target, xs, "run", cx);
+    else for (const f of new Set(xs.map((x) => x.folder))) this.startAgent(a, xs.filter((x) => x.folder === f), "run", cx);
     this.unpick();
   }
 
@@ -1190,19 +1322,8 @@ export default class Todos extends View {
     const pinned = new Set((pinList ?? []).map((f) => f.replace(/\/+$/, "")));
     const hereOk = Boolean(this.here && this.here !== home());
     const inScope = (l) => l.machine || isPersonal(l.folder) || !Array.isArray(pinList) || pinned.has(l.folder) || (hereOk && l.folder === this.here);
-    // A Doing parent owns its whole subtree on screen. Children retain their
-    // own checkbox state, but stay under that parent until it leaves Doing.
     const buckets = {};
-    for (const [slug, l] of Object.entries(this.lists)) {
-      const stack = [];
-      buckets[slug] = l.items.map((x) => {
-        const depth = x.depth ?? 0;
-        while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop();
-        const underDoing = (stack[stack.length - 1]?.underDoing ?? false) || (x.doing && !x.done);
-        stack.push({ depth, underDoing });
-        return underDoing ? "doing" : x.done ? "done" : "todo";
-      });
-    }
+    for (const [slug, l] of Object.entries(this.lists)) buckets[slug] = bucketItems(l.items);
     const bucket = (x) => buckets[x.slug]?.[x.i];
     const all = Object.entries(this.lists).filter(([, l]) => inScope(l)).flatMap(([slug, l]) => l.items.map((x, i) => ({ ...x, slug, i, folder: l.folder })));
     const open = all.filter((x) => bucket(x) === "todo"), doings = all.filter((x) => bucket(x) === "doing"), completed = all.filter((x) => bucket(x) === "done" && (this.doneAll || x.doneOn?.slice(0, 10) === today()))
@@ -1371,7 +1492,7 @@ export default class Todos extends View {
     const agentPick = (a) => this.agentChoices.find((c) => c.key === a.program?.key || c.key === a.app);
     const starter = (x, go) => {
       const { current, project } = this.conversationChoices(x);
-      const running = project.slice(0, 4), make = go ?? ((a) => this.startAgent(a, x, this.taskKind));
+      const running = project.slice(0, 4), make = go ?? ((a, cx) => this.startAgent(a, x, this.taskKind, cx));
       const pick = this.agentChoices.find((a) => a.key === this.newPick) ?? this.agentChoices[0];
       const label = (text) => div().px(7).pt(4).pb(1).text_size(10.5).text_color(t.dim).child(text);
       return v_flex().relative().ml(30).mr(6).mb(6).p(3).gap(1).rounded(8).border_1().border_color(t.border).bg(t.popover)
@@ -1381,13 +1502,13 @@ export default class Todos extends View {
           .on_click((_e, cx) => { this.startFor = null; this.pickOpen = false; cx.notify(); })
           .child(svg("mods/workspace-chrome/x.svg").size(10).text_color(t.muted)))
         .when(Boolean(current), (el) => el.child(label("Current conversation"))
-          .child(option("send-current", (cx) => (go ? go(null, cx, current) : this.sendTo(current, x, this.taskKind)), [
+          .child(option("send-current", (cx) => (go ? go(null, cx, current) : this.sendTo(current, x, this.taskKind, cx)), [
             icon(agentPick(current), 13),
             div().flex_1().min_w(0).truncate().child("This chat"),
             div().size(6).flex_none().rounded(3).bg(t[current.status] ?? t.idle),
           ])))
         .when(running.length > 0, (el) => el.child(label("In this project"))
-          .children(running.map((r) => option(`send-${r.address}`, (cx) => (go ? go(null, cx, r) : this.sendTo(r, x, this.taskKind)), [
+          .children(running.map((r) => option(`send-${r.address}`, (cx) => (go ? go(null, cx, r) : this.sendTo(r, x, this.taskKind, cx)), [
             icon(agentPick(r), 13),
             div().flex_1().min_w(0).truncate().child(this.agentName(r)),
             div().size(6).flex_none().rounded(3).bg(t[r.status] ?? t.idle),
@@ -1430,9 +1551,9 @@ export default class Todos extends View {
         return card([
           div().px(7).pt(3).pb(1).text_size(11).text_color(t.dim).truncate().child(this.agentName(a)),
           modeRow("back", "← back", null, (cx) => { this.menuAgent = null; cx.notify(); }),
-          modeRow("plan", "Plan & discuss", "plan", () => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "plan"); }),
-          modeRow("wbs", "Break into sub-todos", "wbs", () => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "wbs"); }),
-          modeRow("run", "Execute", "run", () => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "run"); }),
+          modeRow("plan", "Plan & discuss", "plan", (cx) => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "plan", cx); }),
+          modeRow("wbs", "Break into sub-todos", "wbs", (cx) => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "wbs", cx); }),
+          modeRow("run", "Execute", "run", (cx) => { this.menuFor = null; this.menuAgent = null; this.sendTo(a, x, "run", cx); }),
         ]);
       }
       return card([
@@ -1547,12 +1668,12 @@ export default class Todos extends View {
       const pc = props()?.color ?? t.accent; // the project's colour, from the panel
       const close = () => closeOverlay(props().overlay);
       const { current, project } = x ? this.conversationChoices(x, props()?.currentAgent) : { current: null, project: [] };
-      const agentRow = (id, a, label = this.agentName(a)) => option(`card-agent-${id}`, (cx) => { this.sendTo(a, x, this.cardKind); close(); }, [
+      const agentRow = (id, a, label = this.agentName(a)) => option(`card-agent-${id}`, (cx) => this.sendTo(a, x, this.cardKind, cx, close), [
         icon(agentPick(a), 12),
         div().flex_1().min_w(0).truncate().child(label),
         div().size(6).flex_none().rounded(3).bg(t[a.status] ?? t.idle),
       ]);
-      const newRow = (a) => option(`card-new-${a.key}`, (cx) => { this.startAgent(a, x, this.cardKind); close(); }, [
+      const newRow = (a) => option(`card-new-${a.key}`, (cx) => this.startAgent(a, x, this.cardKind, cx, close), [
         icon(a, 12),
         div().flex_1().min_w(0).truncate().child(a.name),
       ]);
@@ -1640,7 +1761,7 @@ export default class Todos extends View {
             this.delArmed = true; cx.spawn(async (cx) => { await cx.sleep(3000); this.delArmed = false; cx.notify(); });
           }, this.delArmed ? t.ansi1 : null, true))))
         .when(this.startFor === "sel" && open.length > 0, (el) => el.child(
-          starter({ ...open[0], folder: many ? null : open[0].folder }, (a, _cx, to) => this.sendPicked(a, to)).ml(0).mr(0).mb(0)))
+          starter({ ...open[0], folder: many ? null : open[0].folder }, (a, cx, to) => this.sendPicked(a, to, cx)).ml(0).mr(0).mb(0)))
         .when(this.startFor === "sel" && many, (el) => el.child(div().px(4).text_size(11).text_color(t.dim).child(`A new agent in each of the ${folders.size} projects`)));
     };
     const withStarter = (x) => {
